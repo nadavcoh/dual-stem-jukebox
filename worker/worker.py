@@ -10,7 +10,8 @@ Polls Supabase for 'queued' tracks, claims one atomically via the
   3. Extracts beat-synchronous Chroma STFT + MFCC features per stem.
   4. Builds a vocal<->instrumental cross-similarity matrix (cosine distance).
   5. Filters that matrix for diagonally-coherent "jump points".
-  6. Uploads the mp3 stems + matrix.json to Backblaze B2.
+  6. Uploads the mp3 stems + matrix.json to a private Backblaze B2 bucket
+     and records their object keys (not public URLs).
   7. Marks the row 'completed' (or 'failed') in Supabase.
 
 Run with:  python worker.py
@@ -42,14 +43,11 @@ load_dotenv()
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-B2_KEY_ID = os.environ["B2_KEY_ID"]
-B2_APPLICATION_KEY = os.environ["B2_APPLICATION_KEY"]
+B2_RW_KEY_ID = os.environ["B2_RW_KEY_ID"]
+B2_RW_APPLICATION_KEY = os.environ["B2_RW_APPLICATION_KEY"]
 B2_BUCKET_NAME = os.environ["B2_BUCKET_NAME"]
 B2_ENDPOINT_URL = os.environ["B2_ENDPOINT_URL"]
 B2_REGION = os.environ.get("B2_REGION", "us-west-002")
-B2_PUBLIC_URL_BASE = os.environ.get(
-    "B2_PUBLIC_URL_BASE", f"{B2_ENDPOINT_URL}/{B2_BUCKET_NAME}"
-).rstrip("/")
 
 WORKER_ID = os.environ.get("WORKER_ID", f"worker-{uuid.uuid4().hex[:8]}")
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
@@ -70,8 +68,8 @@ def get_b2():
     return boto3.client(
         "s3",
         endpoint_url=B2_ENDPOINT_URL,
-        aws_access_key_id=B2_KEY_ID,
-        aws_secret_access_key=B2_APPLICATION_KEY,
+        aws_access_key_id=B2_RW_KEY_ID,
+        aws_secret_access_key=B2_RW_APPLICATION_KEY,
         region_name=B2_REGION,
     )
 
@@ -262,6 +260,12 @@ def find_jump_points(
 # 6. Upload to Backblaze B2
 # ---------------------------------------------------------------------------
 def upload_file(b2, local_path: Path, key: str) -> str:
+    """Uploads local_path to B2 under `key` and returns that same key.
+
+    The bucket is private, so there's no public URL to hand back — callers
+    store this key in Supabase, and the Next.js app exchanges it for a
+    short-lived presigned URL at playback time (web/lib/b2Presign.js).
+    """
     extra_args = {}
     if local_path.suffix == ".mp3":
         extra_args["ContentType"] = "audio/mpeg"
@@ -269,7 +273,7 @@ def upload_file(b2, local_path: Path, key: str) -> str:
         extra_args["ContentType"] = "application/json"
 
     b2.upload_file(str(local_path), B2_BUCKET_NAME, key, ExtraArgs=extra_args)
-    return f"{B2_PUBLIC_URL_BASE}/{key}"
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -329,11 +333,11 @@ def process_track(supabase: Client, b2, track: dict):
         matrix_path = job_dir / "matrix.json"
         matrix_path.write_text(json.dumps(matrix_payload))
 
-        # 6. Upload to B2
-        prefix = f"tracks/{track_id}"
-        vocals_url = upload_file(b2, vocals_mp3, f"{prefix}/vocals.mp3")
-        instrumental_url = upload_file(b2, instrumental_mp3, f"{prefix}/instrumental.mp3")
-        matrix_url = upload_file(b2, matrix_path, f"{prefix}/matrix.json")
+        # 6. Upload to B2 — keyed by youtube_id so storage stays organized
+        # by song regardless of which Supabase row (re-)triggered the job.
+        vocals_key = upload_file(b2, vocals_mp3, f"{youtube_id}/vocals.mp3")
+        instrumental_key = upload_file(b2, instrumental_mp3, f"{youtube_id}/instrumental.mp3")
+        matrix_json_key = upload_file(b2, matrix_path, f"{youtube_id}/matrix.json")
 
         # 7. Mark completed
         supabase.table("tracks").update(
@@ -341,9 +345,9 @@ def process_track(supabase: Client, b2, track: dict):
                 "status": "completed",
                 "title": title,
                 "bpm": bpm,
-                "vocals_url": vocals_url,
-                "instrumental_url": instrumental_url,
-                "matrix_json_url": matrix_url,
+                "vocals_key": vocals_key,
+                "instrumental_key": instrumental_key,
+                "matrix_json_key": matrix_json_key,
                 "error_message": None,
             }
         ).eq("id", track_id).execute()

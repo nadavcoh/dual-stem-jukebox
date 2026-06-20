@@ -3,11 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { JukeboxEngine } from "@/lib/audioEngine";
 import { useAudioSync } from "@/hooks/useAudioSync";
+import { getPlaybackUrls } from "@/app/actions/presign";
 
 /**
  * @param {{
- *   trackA: { title: string, vocalsUrl: string, instrumentalUrl: string },
- *   trackB: { title: string, vocalsUrl: string, instrumentalUrl: string },
+ *   trackA: { title: string, vocalsKey: string, instrumentalKey: string },
+ *   trackB: { title: string, vocalsKey: string, instrumentalKey: string },
  *   jumpMap: { jumpPoints: Array, beatTimesA: number[], beatTimesB: number[], bpmA: number, bpmB: number },
  * }} props
  */
@@ -47,15 +48,30 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
       const engine = engineRef.current;
       engine.ensureContext();
 
+      // The bucket is private — exchange object keys for short-lived
+      // presigned URLs right now, immediately before fetching, so they
+      // can't expire while the user was still deciding whether to hit play.
+      const keys = [
+        trackA.vocalsKey,
+        trackA.instrumentalKey,
+        trackB.vocalsKey,
+        trackB.instrumentalKey,
+      ];
+      const presigned = await getPlaybackUrls(keys);
+      if (!presigned.ok) {
+        throw new Error(presigned.error ?? "Couldn't generate playback URLs.");
+      }
+      const { urls } = presigned;
+
       await Promise.all([
         engine.loadTrack("a", {
-          vocalsUrl: trackA.vocalsUrl,
-          instrumentalUrl: trackA.instrumentalUrl,
+          vocalsUrl: urls[trackA.vocalsKey],
+          instrumentalUrl: urls[trackA.instrumentalKey],
           beatTimes: jumpMap.beatTimesA,
         }),
         engine.loadTrack("b", {
-          vocalsUrl: trackB.vocalsUrl,
-          instrumentalUrl: trackB.instrumentalUrl,
+          vocalsUrl: urls[trackB.vocalsKey],
+          instrumentalUrl: urls[trackB.instrumentalKey],
           beatTimes: jumpMap.beatTimesB,
         }),
       ]);
@@ -66,7 +82,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
       setPhase("playing");
     } catch (err) {
       console.error(err);
-      setError("Couldn't load audio — check the stem URLs are reachable.");
+      setError(err?.message ?? "Couldn't load audio — check the stem keys and B2 credentials.");
       setPhase("idle");
     }
   }, [trackA, trackB, jumpMap, mix]);

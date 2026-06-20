@@ -1,4 +1,5 @@
 import { supabaseAdmin } from "@/lib/supabaseServer";
+import { getPresignedUrl } from "@/lib/b2Presign";
 import { buildCrossTrackJumpMap } from "@/lib/crossTrackMatrix";
 import JukeboxPlayer from "@/components/JukeboxPlayer";
 
@@ -25,12 +26,18 @@ export default async function JukeboxPage({ params }) {
     );
   }
 
-  // matrix.json holds the beat-synchronous features the worker computed —
-  // we fetch both and build the A<->B jump map here, server-side, once per
-  // page load, rather than shipping raw feature vectors to the browser.
+  // matrix.json holds the beat-synchronous features the worker computed.
+  // The bucket is private, so we exchange each matrix_json_key for a
+  // short-lived presigned URL (using the read-only B2 key) before
+  // fetching it — this happens server-side, once per page load.
+  const [matrixUrlA, matrixUrlB] = await Promise.all([
+    getPresignedUrl(trackA.matrix_json_key),
+    getPresignedUrl(trackB.matrix_json_key),
+  ]);
+
   const [matrixA, matrixB] = await Promise.all([
-    fetch(trackA.matrix_json_url).then((r) => r.json()),
-    fetch(trackB.matrix_json_url).then((r) => r.json()),
+    fetch(matrixUrlA).then((r) => r.json()),
+    fetch(matrixUrlB).then((r) => r.json()),
   ]);
 
   const jumpMap = buildCrossTrackJumpMap(matrixA, matrixB);
@@ -40,13 +47,13 @@ export default async function JukeboxPage({ params }) {
       <JukeboxPlayer
         trackA={{
           title: trackA.title ?? trackA.youtube_id,
-          vocalsUrl: trackA.vocals_url,
-          instrumentalUrl: trackA.instrumental_url,
+          vocalsKey: trackA.vocals_key,
+          instrumentalKey: trackA.instrumental_key,
         }}
         trackB={{
           title: trackB.title ?? trackB.youtube_id,
-          vocalsUrl: trackB.vocals_url,
-          instrumentalUrl: trackB.instrumental_url,
+          vocalsKey: trackB.vocals_key,
+          instrumentalKey: trackB.instrumental_key,
         }}
         jumpMap={jumpMap}
       />

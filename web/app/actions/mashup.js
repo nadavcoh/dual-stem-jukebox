@@ -37,7 +37,7 @@ export async function requestMashup({ a, b }) {
 
     const { data: existing, error: selectError } = await supabase
       .from("tracks")
-      .select("id, youtube_id, title, status, vocals_url, instrumental_url, matrix_json_url, bpm")
+      .select("id, youtube_id, title, status, vocals_key, instrumental_key, matrix_json_key, bpm")
       .in("youtube_id", [idA, idB]);
 
     if (selectError) {
