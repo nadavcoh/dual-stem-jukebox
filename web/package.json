@@ -1,0 +1,24 @@
+{
+  "name": "dual-stem-jukebox-web",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "next": "^15.0.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "server-only": "^0.0.1",
+    "yt-search": "^2.11.1"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.6"
+  }
+}
