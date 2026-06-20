@@ -1,4 +1,4 @@
-supabase==2.6.0
+supabase>=2.18.0
 yt-dlp>=2024.8.6
 demucs>=4.0.1
 torch>=2.1.0
