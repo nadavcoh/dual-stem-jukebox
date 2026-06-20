@@ -85,13 +85,23 @@ export default function TrackSearch() {
     e.preventDefault();
     setError(null);
     startSearch(async () => {
-      const { videos, error: searchError } = await searchYouTube(query);
-      if (searchError) {
-        setError(searchError);
+      try {
+        const { videos, error: searchError } = await searchYouTube(query);
+        if (searchError) {
+          setError(searchError);
+          setResults([]);
+          return;
+        }
+        setResults(videos);
+      } catch (err) {
+        // Belt-and-suspenders: searchYouTube catches its own errors, but a
+        // failure in *invoking* the Server Action itself (cold start crash,
+        // network blip, etc.) happens before that code ever runs and would
+        // otherwise be an uncaught error with nothing here to catch it.
+        console.error("[TrackSearch] search action failed:", err);
+        setError(err?.message ?? "Search request failed — check your connection and try again.");
         setResults([]);
-        return;
       }
-      setResults(videos);
     });
   }
 
@@ -102,21 +112,27 @@ export default function TrackSearch() {
   function pollUntilReady(idA, idB) {
     clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
-      const res = await getMashupStatus(idA, idB);
-      if (!res.ok) return;
-      const byId = Object.fromEntries(res.tracks.map((t) => [t.youtube_id, t]));
-      const a = byId[idA]?.status ?? "queued";
-      const b = byId[idB]?.status ?? "queued";
-      if (a === "failed" || b === "failed") {
-        clearInterval(pollRef.current);
-        setStatusMessage(null);
-        setError("One of the tracks failed to process. Try a different video.");
-        return;
-      }
-      setStatusMessage(`Track A: ${a} · Track B: ${b}`);
-      if (res.ready) {
-        clearInterval(pollRef.current);
-        router.push(`/jukebox/${idA}/${idB}`);
+      try {
+        const res = await getMashupStatus(idA, idB);
+        if (!res.ok) return;
+        const byId = Object.fromEntries(res.tracks.map((t) => [t.youtube_id, t]));
+        const a = byId[idA]?.status ?? "queued";
+        const b = byId[idB]?.status ?? "queued";
+        if (a === "failed" || b === "failed") {
+          clearInterval(pollRef.current);
+          setStatusMessage(null);
+          setError("One of the tracks failed to process. Try a different video.");
+          return;
+        }
+        setStatusMessage(`Track A: ${a} · Track B: ${b}`);
+        if (res.ready) {
+          clearInterval(pollRef.current);
+          router.push(`/jukebox/${idA}/${idB}`);
+        }
+      } catch (err) {
+        // Don't let one flaky poll kill the loop or the page — just log it
+        // and let the next tick try again.
+        console.error("[TrackSearch] status poll failed:", err);
       }
     }, 4000);
   }
@@ -125,18 +141,23 @@ export default function TrackSearch() {
     if (!slotA || !slotB) return;
     setError(null);
     startSubmit(async () => {
-      const result = await requestMashup({
-        a: { input: slotA.youtubeId, title: slotA.title },
-        b: { input: slotB.youtubeId, title: slotB.title },
-      });
-      // If both tracks were already completed, requestMashup() already
-      // redirect()ed server-side and execution never reaches here.
-      if (!result.ok) {
-        setError(result.error);
-        return;
+      try {
+        const result = await requestMashup({
+          a: { input: slotA.youtubeId, title: slotA.title },
+          b: { input: slotB.youtubeId, title: slotB.title },
+        });
+        // If both tracks were already completed, requestMashup() already
+        // redirect()ed server-side and execution never reaches here.
+        if (!result.ok) {
+          setError(result.error);
+          return;
+        }
+        setStatusMessage(`Track A: ${result.trackA.status} · Track B: ${result.trackB.status}`);
+        pollUntilReady(result.trackA.youtubeId, result.trackB.youtubeId);
+      } catch (err) {
+        console.error("[TrackSearch] mashup action failed:", err);
+        setError(err?.message ?? "Couldn't queue the mashup — try again in a moment.");
       }
-      setStatusMessage(`Track A: ${result.trackA.status} · Track B: ${result.trackB.status}`);
-      pollUntilReady(result.trackA.youtubeId, result.trackB.youtubeId);
     });
   }
 
