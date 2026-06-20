@@ -41,7 +41,12 @@ load_dotenv()
 # Config
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+# Supabase is deprecating the legacy JWT-based anon/service_role keys in
+# favor of opaque publishable (sb_publishable_...) / secret (sb_secret_...)
+# keys — same permissions, but rotatable and revocable without breaking
+# every other client. The SDK accepts either format with zero code changes;
+# this is purely an env var rename to the new key type.
+SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"]
 
 B2_RW_KEY_ID = os.environ["B2_RW_KEY_ID"]
 B2_RW_APPLICATION_KEY = os.environ["B2_RW_APPLICATION_KEY"]
@@ -61,7 +66,7 @@ SR = 22050  # analysis sample rate for librosa
 # Clients
 # ---------------------------------------------------------------------------
 def get_supabase() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
 def get_b2():

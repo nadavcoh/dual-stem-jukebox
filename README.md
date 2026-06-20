@@ -33,7 +33,7 @@ dual-stem-jukebox/
     │   ├── audioEngine.js        # JukeboxEngine — the Web Audio scheduler/router
     │   ├── crossTrackMatrix.js   # cosine-similarity + diagonal jump-point filter (JS port)
     │   ├── b2Presign.js          # read-only S3 client + presigned URL helpers (private bucket)
-    │   ├── supabaseClient.js     # anon key, browser
+    │   ├── supabaseClient.js     # publishable key, browser
     │   └── supabaseServer.js     # service-role key, server only
     ├── package.json
     ├── tailwind.config.js / postcss.config.js / next.config.js / jsconfig.json
@@ -85,7 +85,13 @@ dual-stem-jukebox/
 
 - Create a project, then run everything in `supabase/migrations/` in order
   (SQL editor, or `supabase db push` if you're using the CLI).
-- Grab the project URL, `anon` key, and `service_role` key.
+- Grab the project URL plus the **publishable** and **secret** keys from
+  Project Settings → API Keys (`sb_publishable_...` / `sb_secret_...`).
+  These replace the legacy `anon`/`service_role` JWT keys — same
+  permissions, but rotatable and revocable independently. Legacy keys still
+  work today but are being phased out by end of 2026; if your project
+  doesn't show a Publishable/Secret tab yet, click "Create new API keys"
+  to add them alongside your existing ones.
 
 ### 2. Backblaze B2
 
@@ -127,7 +133,7 @@ npm run dev
 **`worker/.env`**
 | Var | Purpose |
 |---|---|
-| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Service-role access to claim/update jobs, bypassing RLS |
+| `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | Secret-key access to claim/update jobs, bypassing RLS |
 | `B2_RW_KEY_ID`, `B2_RW_APPLICATION_KEY` | Read-write B2 key — uploads only, never used by the web app |
 | `B2_BUCKET_NAME`, `B2_ENDPOINT_URL`, `B2_REGION` | boto3 S3-compatible client config |
 | `WORKER_ID`, `POLL_INTERVAL_SECONDS`, `STALE_JOB_TIMEOUT_MINUTES`, `WORK_DIR`, `DEMUCS_MODEL` | Worker behavior tuning |
@@ -135,8 +141,8 @@ npm run dev
 **`web/.env.local`**
 | Var | Purpose |
 |---|---|
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Read-only client-side queries |
-| `SUPABASE_SERVICE_ROLE_KEY` | Server Actions only — enqueues jobs, bypassing RLS |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Read-only client-side queries |
+| `SUPABASE_SECRET_KEY` | Server Actions only — enqueues jobs, bypassing RLS |
 | `B2_READ_KEY_ID`, `B2_READ_APPLICATION_KEY` | Read-only B2 key — can only generate GET presigned URLs |
 | `B2_BUCKET_NAME`, `B2_ENDPOINT_URL`, `B2_REGION` | Same bucket as the worker, used by `lib/b2Presign.js` |
 
