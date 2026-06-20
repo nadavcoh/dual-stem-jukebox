@@ -85,11 +85,13 @@ export default function TrackSearch() {
     e.preventDefault();
     setError(null);
     startSearch(async () => {
-      try {
-        setResults(await searchYouTube(query));
-      } catch {
-        setError("Search failed — try a different query.");
+      const { videos, error: searchError } = await searchYouTube(query);
+      if (searchError) {
+        setError(searchError);
+        setResults([]);
+        return;
       }
+      setResults(videos);
     });
   }
 
