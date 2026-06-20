@@ -1,7 +1,5 @@
 "use server";
 
-import ytSearch from "yt-search";
-
 /**
  * Searches YouTube for tracks without any API key. Runs server-side only
  * (yt-search scrapes YouTube's search page), called from TrackSearch.
@@ -12,6 +10,15 @@ import ytSearch from "yt-search";
  * message as data instead lets the UI (and you, debugging this) actually
  * see what failed.
  *
+ * The yt-search import is *inside* the try block on purpose: a static
+ * top-level `import` that fails to load (missing/incompatible package in
+ * the deployed runtime) throws at module-evaluation time, before any of
+ * our own code runs — which is exactly the kind of throw that was getting
+ * caught by nothing and redacted by Next.js into the generic
+ * "An error occurred in the Server Components render" message. A dynamic
+ * import here means that failure mode is now caught and returned as data
+ * too.
+ *
  * @param {string} query
  * @returns {Promise<{videos: Array<{youtubeId: string, title: string, author: string, durationSeconds: number, thumbnail: string}>, error: string|null}>}
  */
@@ -20,6 +27,7 @@ export async function searchYouTube(query) {
   if (trimmed.length < 2) return { videos: [], error: null };
 
   try {
+    const { default: ytSearch } = await import("yt-search");
     const result = await ytSearch(trimmed);
     const rawVideos = result?.videos ?? [];
 
@@ -47,10 +55,12 @@ export async function searchYouTube(query) {
 
     return { videos, error: null };
   } catch (err) {
-    // This is the one that matters most for debugging deploy failures: it
-    // also shows up in `vercel logs` / the Vercel dashboard's Function Logs
-    // for this action, with the full stack trace.
-    console.error("[searchYouTube] threw:", err);
+    // This now catches EVERYTHING related to yt-search: failing to load
+    // the package at all, the search call itself throwing, or the mapping
+    // above throwing on an unexpected shape. The message reaches the UI
+    // verbatim instead of Next.js's redacted placeholder, because we're
+    // returning it as data rather than letting it escape as a thrown error.
+    console.error("[searchYouTube] failed:", err);
     return { videos: [], error: err?.message ?? "Unknown search error" };
   }
 }
