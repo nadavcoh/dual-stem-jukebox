@@ -53,6 +53,11 @@ B2_RW_KEY_ID = os.environ["B2_RW_KEY_ID"]
 B2_RW_APPLICATION_KEY = os.environ["B2_RW_APPLICATION_KEY"]
 B2_BUCKET_NAME = os.environ["B2_BUCKET_NAME"]
 B2_ENDPOINT_URL = os.environ["B2_ENDPOINT_URL"]
+# B2's dashboard shows the bucket's "Endpoint" field as a bare hostname
+# (e.g. "s3.eu-central-003.backblazeb2.com"), no scheme — boto3 needs a
+# full URL or it raises further down the line. Tolerate both forms.
+if not B2_ENDPOINT_URL.startswith(("http://", "https://")):
+    B2_ENDPOINT_URL = f"https://{B2_ENDPOINT_URL}"
 B2_REGION = os.environ.get("B2_REGION", "us-west-002")
 
 WORKER_ID = os.environ.get("WORKER_ID", f"worker-{uuid.uuid4().hex[:8]}")

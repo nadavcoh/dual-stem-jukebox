@@ -10,6 +10,19 @@ const DEFAULT_EXPIRES_IN_SECONDS = 300; // 5 minutes
 let cachedClient = null;
 
 /**
+ * B2's dashboard shows the bucket's "Endpoint" field as a bare hostname —
+ * e.g. "s3.eu-central-003.backblazeb2.com" — with no scheme. The AWS SDK's
+ * `endpoint` option needs a full URL though; passed the bare hostname, it
+ * throws `TypeError [ERR_INVALID_URL]` the moment anything tries to build
+ * a request. Tolerate both forms here instead of relying on everyone who
+ * ever sets this env var to know to prepend https://.
+ */
+function normalizeEndpoint(value) {
+  if (!value) return value;
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
+/**
  * Read-only S3 client for the private B2 bucket. Deliberately uses its
  * own separate, read-only application key — B2_READ_KEY_ID /
  * B2_READ_APPLICATION_KEY — distinct from the read-write key pair the
@@ -19,7 +32,7 @@ let cachedClient = null;
 function getReadOnlyClient() {
   if (!cachedClient) {
     cachedClient = new S3Client({
-      endpoint: process.env.B2_ENDPOINT_URL,
+      endpoint: normalizeEndpoint(process.env.B2_ENDPOINT_URL),
       region: process.env.B2_REGION,
       forcePathStyle: true, // required for B2's S3-compatible endpoint
       credentials: {
