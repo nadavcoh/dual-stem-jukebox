@@ -17,21 +17,24 @@ dual-stem-jukebox/
 └── web/                        # Next.js App Router frontend
     ├── app/
     │   ├── actions/
-    │   │   ├── search.js        # Server Action: yt-search wrapper
-    │   │   ├── mashup.js        # Server Action: enqueue + redirect to player
+    │   │   ├── search.js        # Server Action: yt-search wrapper + geo-block pre-filter
+    │   │   ├── library.js       # Server Action: enqueue one track / list the library
     │   │   └── presign.js       # Server Action: object keys -> presigned URLs
     │   ├── jukebox/[idA]/[idB]/page.jsx  # builds the cross-track jump map, renders player
     │   ├── layout.jsx
-    │   ├── page.jsx              # search landing page
+    │   ├── page.jsx              # renders Workbench
     │   └── globals.css
     ├── components/
-    │   ├── TrackSearch.jsx
+    │   ├── Workbench.jsx          # tab switcher: Add Songs / Build Mashup
+    │   ├── TrackSearch.jsx        # "Add Songs" tab — search + request processing
+    │   ├── MashupLibrary.jsx      # "Build Mashup" tab — pick 2 completed tracks
     │   └── JukeboxPlayer.jsx
     ├── hooks/
     │   └── useAudioSync.js
     ├── lib/
     │   ├── audioEngine.js        # JukeboxEngine — the Web Audio scheduler/router
     │   ├── crossTrackMatrix.js   # cosine-similarity + diagonal jump-point filter (JS port)
+    │   ├── youtubePlayability.js # best-effort region-block check for search results
     │   ├── b2Presign.js          # read-only S3 client + presigned URL helpers (private bucket)
     │   ├── supabaseClient.js     # publishable key, browser
     │   └── supabaseServer.js     # service-role key, server only
@@ -42,13 +45,19 @@ dual-stem-jukebox/
 
 ## How the pieces fit together
 
-1. **Search & request** — `TrackSearch` searches YouTube via `yt-search` (no
-   API key) and lets you assign two results to slot A / slot B. "Build
-   Mashup" calls the `requestMashup` Server Action.
-2. **Queue** — `requestMashup` extracts each video's 11-character id, checks
-   `tracks` in Supabase, and `upsert`s a `'queued'` row for whichever track
-   isn't already `'completed'`. If both already are, it `redirect()`s
-   straight to the player.
+1. **Add Songs tab** — `TrackSearch` searches YouTube via `yt-search` (no API
+   key). Results that `lib/youtubePlayability.js` can confidently tell are
+   region-blocked are filtered out before you ever see them (best-effort —
+   see that file's doc comment for the real caveats). Each result gets its
+   own "Add to library" button, which calls `requestProcessing` — there's
+   no second track, no slot-matching, no waiting here; it just enqueues
+   that one track and you move on.
+2. **Build Mashup tab** — `MashupLibrary` shows everything `getLibrary()`
+   returns, split into completed (pickable for A/B) and
+   in-progress/failed (visible for status, not pickable). Picking two
+   completed tracks and hitting "Open Mashup" is a plain client-side
+   `router.push()` — no Server Action, no queueing, because both tracks
+   are already known-completed by construction.
 3. **Process (off-platform)** — your local `worker.py` polls
    `claim_next_track()`, which uses `SELECT ... FOR UPDATE SKIP LOCKED` so
    multiple workers never grab the same job. It downloads the audio
@@ -59,7 +68,10 @@ dual-stem-jukebox/
    `matrix.json` to a **private** Backblaze B2 bucket (`boto3`, read-write
    key), and marks the row `'completed'` with their **object keys**
    (`{youtube_id}/vocals.mp3`, etc.) — not public URLs, since the bucket
-   isn't public.
+   isn't public. A video that's blocked in the worker's region gets a clean
+   one-line `GEO-BLOCKED` log and `status='failed'` instead of a traceback —
+   that's an expected outcome, not a bug, and the only place that knows for
+   certain (the pre-filter in step 1 is best-effort, this is authoritative).
 4. **Build the real jump map** — `matrix.json` stores each track's raw
    beat-synced features, not just its self jump points. When you open
    `/jukebox/[idA]/[idB]`, the Server Component exchanges each track's
@@ -145,6 +157,7 @@ npm run dev
 | `SUPABASE_SECRET_KEY` | Server Actions only — enqueues jobs, bypassing RLS |
 | `B2_READ_KEY_ID`, `B2_READ_APPLICATION_KEY` | Read-only B2 key — can only generate GET presigned URLs |
 | `B2_BUCKET_NAME`, `B2_ENDPOINT_URL`, `B2_REGION` | Same bucket as the worker, used by `lib/b2Presign.js` |
+| `YOUTUBE_REGION_CODE` | Country code to check region-blocks against (set to your *worker's* region, not Vercel's) |
 
 ## Notes & honest caveats
 
@@ -152,6 +165,14 @@ npm run dev
   official API, so its DOM/JSON shape can drift; pin a version and re-check
   the `videos[]` field names (`videoId`, `title`, `author.name`, `seconds`,
   `thumbnail`) if results come back empty.
+- **The geo-block search filter (`lib/youtubePlayability.js`) is
+  best-effort, not authoritative.** It checks a region you configure
+  (`YOUTUBE_REGION_CODE`), via the same unofficial endpoint yt-dlp uses
+  internally — it can start getting bot-walled by YouTube the same way
+  `yt-search` can, and it fails *open* (shows the video) whenever it can't
+  get a clear answer, on purpose, to avoid hiding things that would have
+  worked fine. The worker's own `GEO-BLOCKED` log when a download actually
+  fails is the only fully reliable signal.
 - **Respect YouTube's Terms of Service and copyright law** for whatever you
   download and remix — this stack is built for personal experimentation /
   DJ-style mashups, not redistribution of others' recordings.

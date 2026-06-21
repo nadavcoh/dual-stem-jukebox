@@ -1,5 +1,7 @@
 "use server";
 
+import { filterPlayableVideos } from "@/lib/youtubePlayability";
+
 /**
  * Searches YouTube for tracks without any API key. Runs server-side only
  * (yt-search scrapes YouTube's search page), called from TrackSearch.
@@ -20,7 +22,7 @@
  * too.
  *
  * @param {string} query
- * @returns {Promise<{videos: Array<{youtubeId: string, title: string, author: string, durationSeconds: number, thumbnail: string}>, error: string|null}>}
+ * @returns {Promise<{videos: Array<{youtubeId: string, title: string, author: string, durationSeconds: number, thumbnail: string}>, error: string|null, hiddenCount?: number}>}
  */
 export async function searchYouTube(query) {
   const trimmed = (query || "").trim();
@@ -31,7 +33,7 @@ export async function searchYouTube(query) {
     const result = await ytSearch(trimmed);
     const rawVideos = result?.videos ?? [];
 
-    const videos = rawVideos.slice(0, 12).map((v) => ({
+    const allVideos = rawVideos.slice(0, 12).map((v) => ({
       youtubeId: v.videoId,
       title: v.title,
       author: v.author?.name ?? "Unknown",
@@ -39,7 +41,7 @@ export async function searchYouTube(query) {
       thumbnail: v.thumbnail,
     }));
 
-    if (videos.length === 0) {
+    if (allVideos.length === 0) {
       // ytSearch resolved without throwing but gave back nothing — this is
       // the classic signature of YouTube serving a consent/anti-bot page
       // instead of real results to a datacenter IP, not a code bug.
@@ -53,7 +55,23 @@ export async function searchYouTube(query) {
       };
     }
 
-    return { videos, error: null };
+    // Best-effort pre-filter: drop results that are region-blocked wherever
+    // YOUTUBE_REGION_CODE is set to (ideally your worker's region — see
+    // lib/youtubePlayability.js for the important caveats on this check).
+    // Failures here never affect the search itself — worst case we just
+    // skip filtering and show everything yt-search gave us.
+    let videos = allVideos;
+    let hiddenCount = 0;
+    try {
+      const regionCode = process.env.YOUTUBE_REGION_CODE || "US";
+      const filtered = await filterPlayableVideos(allVideos, regionCode);
+      videos = filtered.videos;
+      hiddenCount = filtered.hiddenCount;
+    } catch (filterErr) {
+      console.warn("[searchYouTube] playability filter failed, showing unfiltered results:", filterErr);
+    }
+
+    return { videos, error: null, hiddenCount };
   } catch (err) {
     // This now catches EVERYTHING related to yt-search: failing to load
     // the package at all, the search call itself throwing, or the mapping

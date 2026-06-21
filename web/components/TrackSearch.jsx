@@ -1,103 +1,99 @@
 "use client";
 
-import { useEffect, useRef, useState, useTransition } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState, useTransition } from "react";
 import { searchYouTube } from "@/app/actions/search";
-import { requestMashup, getMashupStatus } from "@/app/actions/mashup";
+import { requestProcessing, getLibrary } from "@/app/actions/library";
 
-const SLOT_STYLES = {
-  a: { label: "Track A", ring: "ring-cyan-400", text: "text-cyan-300", dot: "bg-cyan-400" },
-  b: { label: "Track B", ring: "ring-orange-400", text: "text-orange-300", dot: "bg-orange-400" },
+const STATUS_STYLES = {
+  queued: "border-stone-600 text-stone-400",
+  processing: "border-amber-400/50 text-amber-300",
+  completed: "border-emerald-400/50 text-emerald-300",
+  failed: "border-red-400/50 text-red-300",
 };
 
-function ResultRow({ result, onPick }) {
+function StatusBadge({ status }) {
+  return (
+    <span
+      className={`rounded border px-2 py-1 text-xs font-mono uppercase ${
+        STATUS_STYLES[status] ?? "border-stone-600 text-stone-400"
+      }`}
+    >
+      {status}
+    </span>
+  );
+}
+
+function ResultRow({ result, status, onRequest, isRequesting }) {
   const minutes = Math.floor(result.durationSeconds / 60);
   const seconds = String(result.durationSeconds % 60).padStart(2, "0");
+
   return (
     <li className="flex items-center gap-3 rounded-md p-2 hover:bg-white/5">
-      <img
-        src={result.thumbnail}
-        alt=""
-        className="h-10 w-16 flex-shrink-0 rounded object-cover"
-      />
+      <img src={result.thumbnail} alt="" className="h-10 w-16 flex-shrink-0 rounded object-cover" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-stone-100">{result.title}</p>
         <p className="truncate text-xs text-stone-400">
           {result.author} · {minutes}:{seconds}
         </p>
       </div>
-      <div className="flex gap-1.5">
-        <button
-          onClick={() => onPick("a", result)}
-          className="rounded border border-cyan-400/40 px-2 py-1 text-xs font-mono text-cyan-300 hover:bg-cyan-400/10"
-        >
-          A
-        </button>
-        <button
-          onClick={() => onPick("b", result)}
-          className="rounded border border-orange-400/40 px-2 py-1 text-xs font-mono text-orange-300 hover:bg-orange-400/10"
-        >
-          B
-        </button>
-      </div>
-    </li>
-  );
-}
-
-function SlotCard({ slot, track }) {
-  const style = SLOT_STYLES[slot];
-  return (
-    <div
-      className={`flex-1 rounded-lg border border-stone-800 bg-stone-900/60 p-3 ${
-        track ? `ring-1 ${style.ring}` : ""
-      }`}
-    >
-      <div className="flex items-center gap-2">
-        <span className={`h-1.5 w-1.5 rounded-full ${style.dot}`} />
-        <span className={`text-xs font-mono uppercase tracking-wide ${style.text}`}>
-          {style.label}
-        </span>
-      </div>
-      {track ? (
-        <p className="mt-1 truncate text-sm text-stone-200">{track.title}</p>
+      {status && status !== "failed" ? (
+        <StatusBadge status={status} />
       ) : (
-        <p className="mt-1 text-sm text-stone-500">Pick a track below…</p>
+        <button
+          onClick={() => onRequest(result)}
+          disabled={isRequesting}
+          className="whitespace-nowrap rounded border border-cyan-400/40 px-2 py-1 text-xs font-mono text-cyan-300 hover:bg-cyan-400/10 disabled:opacity-40"
+        >
+          {isRequesting ? "Queuing…" : status === "failed" ? "Retry" : "Add to library"}
+        </button>
       )}
-    </div>
+    </li>
   );
 }
 
 export default function TrackSearch() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
-  const [slotA, setSlotA] = useState(null);
-  const [slotB, setSlotB] = useState(null);
-  const [statusMessage, setStatusMessage] = useState(null);
+  const [hiddenCount, setHiddenCount] = useState(0);
+  const [statusByYoutubeId, setStatusByYoutubeId] = useState({});
+  const [requestingId, setRequestingId] = useState(null);
   const [error, setError] = useState(null);
+  const [notice, setNotice] = useState(null);
   const [isSearching, startSearch] = useTransition();
-  const [isSubmitting, startSubmit] = useTransition();
-  const pollRef = useRef(null);
-  const router = useRouter();
 
-  useEffect(() => () => clearInterval(pollRef.current), []);
+  // Pull current library statuses once on mount so freshly-rendered search
+  // results can immediately show "already queued/completed" instead of an
+  // action button that would just re-queue something already in flight.
+  useEffect(() => {
+    refreshLibraryStatuses();
+  }, []);
+
+  async function refreshLibraryStatuses() {
+    try {
+      const res = await getLibrary();
+      if (res.ok) {
+        setStatusByYoutubeId(Object.fromEntries(res.tracks.map((t) => [t.youtube_id, t.status])));
+      }
+    } catch (err) {
+      console.error("[TrackSearch] library refresh failed:", err);
+    }
+  }
 
   function handleSearch(e) {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     startSearch(async () => {
       try {
-        const { videos, error: searchError } = await searchYouTube(query);
+        const { videos, error: searchError, hiddenCount: hidden } = await searchYouTube(query);
         if (searchError) {
           setError(searchError);
           setResults([]);
           return;
         }
         setResults(videos);
+        setHiddenCount(hidden ?? 0);
       } catch (err) {
-        // Belt-and-suspenders: searchYouTube catches its own errors, but a
-        // failure in *invoking* the Server Action itself (cold start crash,
-        // network blip, etc.) happens before that code ever runs and would
-        // otherwise be an uncaught error with nothing here to catch it.
         console.error("[TrackSearch] search action failed:", err);
         setError(err?.message ?? "Search request failed — check your connection and try again.");
         setResults([]);
@@ -105,69 +101,32 @@ export default function TrackSearch() {
     });
   }
 
-  function handlePick(slot, result) {
-    (slot === "a" ? setSlotA : setSlotB)(result);
-  }
-
-  function pollUntilReady(idA, idB) {
-    clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
-      try {
-        const res = await getMashupStatus(idA, idB);
-        if (!res.ok) return;
-        const byId = Object.fromEntries(res.tracks.map((t) => [t.youtube_id, t]));
-        const a = byId[idA]?.status ?? "queued";
-        const b = byId[idB]?.status ?? "queued";
-        if (a === "failed" || b === "failed") {
-          clearInterval(pollRef.current);
-          setStatusMessage(null);
-          setError("One of the tracks failed to process. Try a different video.");
-          return;
-        }
-        setStatusMessage(`Track A: ${a} · Track B: ${b}`);
-        if (res.ready) {
-          clearInterval(pollRef.current);
-          router.push(`/jukebox/${idA}/${idB}`);
-        }
-      } catch (err) {
-        // Don't let one flaky poll kill the loop or the page — just log it
-        // and let the next tick try again.
-        console.error("[TrackSearch] status poll failed:", err);
-      }
-    }, 4000);
-  }
-
-  function handleMashup() {
-    if (!slotA || !slotB) return;
+  async function handleRequest(result) {
     setError(null);
-    startSubmit(async () => {
-      try {
-        const result = await requestMashup({
-          a: { input: slotA.youtubeId, title: slotA.title },
-          b: { input: slotB.youtubeId, title: slotB.title },
-        });
-        // If both tracks were already completed, requestMashup() already
-        // redirect()ed server-side and execution never reaches here.
-        if (!result.ok) {
-          setError(result.error);
-          return;
-        }
-        setStatusMessage(`Track A: ${result.trackA.status} · Track B: ${result.trackB.status}`);
-        pollUntilReady(result.trackA.youtubeId, result.trackB.youtubeId);
-      } catch (err) {
-        console.error("[TrackSearch] mashup action failed:", err);
-        setError(err?.message ?? "Couldn't queue the mashup — try again in a moment.");
+    setNotice(null);
+    setRequestingId(result.youtubeId);
+    try {
+      const res = await requestProcessing({ input: result.youtubeId, title: result.title });
+      if (!res.ok) {
+        setError(res.error);
+        return;
       }
-    });
+      setStatusByYoutubeId((prev) => ({ ...prev, [result.youtubeId]: res.status }));
+      setNotice(
+        res.alreadyExists
+          ? `Already in the library (${res.status}).`
+          : "Added to the queue — check the Build Mashup tab once it's completed."
+      );
+    } catch (err) {
+      console.error("[TrackSearch] requestProcessing failed:", err);
+      setError(err?.message ?? "Couldn't queue this track — try again in a moment.");
+    } finally {
+      setRequestingId(null);
+    }
   }
 
   return (
     <div className="mx-auto w-full max-w-xl space-y-4">
-      <div className="flex gap-3">
-        <SlotCard slot="a" track={slotA} />
-        <SlotCard slot="b" track={slotB} />
-      </div>
-
       <form onSubmit={handleSearch} className="flex gap-2">
         <input
           value={query}
@@ -185,26 +144,25 @@ export default function TrackSearch() {
       </form>
 
       {results.length > 0 && (
-        <ul className="max-h-80 space-y-1 overflow-y-auto rounded-lg border border-stone-800 p-1">
+        <ul className="max-h-96 space-y-1 overflow-y-auto rounded-lg border border-stone-800 p-1">
           {results.map((r) => (
-            <ResultRow key={r.youtubeId} result={r} onPick={handlePick} />
+            <ResultRow
+              key={r.youtubeId}
+              result={r}
+              status={statusByYoutubeId[r.youtubeId]}
+              isRequesting={requestingId === r.youtubeId}
+              onRequest={handleRequest}
+            />
           ))}
         </ul>
       )}
 
-      <button
-        onClick={handleMashup}
-        disabled={!slotA || !slotB || isSubmitting}
-        className="w-full rounded-md bg-gradient-to-r from-cyan-500 to-orange-500 px-4 py-2.5 text-sm font-semibold text-stone-950 disabled:opacity-40"
-      >
-        {isSubmitting ? "Queuing…" : "Build Mashup"}
-      </button>
-
-      {statusMessage && (
-        <p className="text-center font-mono text-xs text-stone-400">
-          Processing on the worker — {statusMessage}
+      {hiddenCount > 0 && (
+        <p className="text-center font-mono text-[11px] text-stone-500">
+          {hiddenCount} result{hiddenCount === 1 ? "" : "s"} hidden — blocked in your configured region
         </p>
       )}
+      {notice && <p className="text-center text-sm text-emerald-300">{notice}</p>}
       {error && <p className="text-center text-sm text-red-400">{error}</p>}
     </div>
   );

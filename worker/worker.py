@@ -34,6 +34,7 @@ import numpy as np
 from dotenv import load_dotenv
 from scipy.spatial.distance import cdist
 from supabase import Client, create_client
+from yt_dlp.utils import GeoRestrictedError
 
 load_dotenv()
 
@@ -282,6 +283,30 @@ def upload_file(b2, local_path: Path, key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+# yt-dlp's YouTube extractor doesn't raise a typed exception for rightsholder
+# country blocks (the GeoRestrictedError class above is used by a handful of
+# *other* extractors that have explicit allowed-country metadata) — for
+# YouTube it's a generic ExtractorError/DownloadError with one of these
+# phrases in the message. Match on text as a fallback for that case.
+_GEO_BLOCK_PHRASES = (
+    "blocked it in your country",
+    "not available in your country",
+    "blocked in your country",
+    "not made this video available in your country",
+)
+
+
+def is_geo_blocked_error(exc: Exception) -> bool:
+    if isinstance(exc, GeoRestrictedError):
+        return True
+    message = str(exc).lower()
+    return any(phrase in message for phrase in _GEO_BLOCK_PHRASES)
+
+
+# ---------------------------------------------------------------------------
 # Job processing
 # ---------------------------------------------------------------------------
 def process_track(supabase: Client, b2, track: dict):
@@ -360,10 +385,19 @@ def process_track(supabase: Client, b2, track: dict):
         print(f"[{WORKER_ID}] Completed {youtube_id}")
 
     except Exception as exc:  # noqa: BLE001
-        print(f"[{WORKER_ID}] FAILED {youtube_id}: {exc}")
-        traceback.print_exc()
+        if is_geo_blocked_error(exc):
+            # Expected, not a bug — YouTube/the rightsholder blocked this
+            # video for this worker's region. No traceback noise; one clean
+            # line is all this needs.
+            print(f"[{WORKER_ID}] GEO-BLOCKED {youtube_id} — unavailable in this worker's region, skipping.")
+            error_message = f"geo_blocked: {exc}"[:2000]
+        else:
+            print(f"[{WORKER_ID}] FAILED {youtube_id}: {exc}")
+            traceback.print_exc()
+            error_message = str(exc)[:2000]
+
         supabase.table("tracks").update(
-            {"status": "failed", "error_message": str(exc)[:2000]}
+            {"status": "failed", "error_message": error_message}
         ).eq("id", track_id).execute()
 
     finally:
