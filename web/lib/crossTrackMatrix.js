@@ -95,11 +95,54 @@ export function findDiagonalJumpPoints(
 }
 
 /**
+ * Reduces a similarity matrix to at most maxSize x maxSize cells via *max*
+ * pooling — keep the strongest value in each bin — so the heatmap payload
+ * stays a reasonable size regardless of song length, while still showing
+ * where the bright (high-similarity) spots are. Averaging would wash out
+ * exactly the sparse peaks that matter most here; max-pooling preserves them.
+ *
+ * @param {number[][]} matrix
+ * @param {number} maxSize
+ * @returns {{ data: number[][], rows: number, cols: number, binRows: number, binCols: number }}
+ */
+export function downsampleMatrix(matrix, maxSize = 160) {
+  const n = matrix.length;
+  const m = n > 0 ? matrix[0].length : 0;
+
+  if (n <= maxSize && m <= maxSize) {
+    return { data: matrix, rows: n, cols: m, binRows: 1, binCols: 1 };
+  }
+
+  const rows = Math.min(n, maxSize);
+  const cols = Math.min(m, maxSize);
+  const binRows = Math.ceil(n / rows);
+  const binCols = Math.ceil(m / cols);
+
+  const data = Array.from({ length: rows }, () => new Array(cols).fill(0));
+  for (let i = 0; i < n; i++) {
+    const ri = Math.min(Math.floor(i / binRows), rows - 1);
+    const row = matrix[i];
+    const outRow = data[ri];
+    for (let j = 0; j < m; j++) {
+      const rj = Math.min(Math.floor(j / binCols), cols - 1);
+      if (row[j] > outRow[rj]) outRow[rj] = row[j];
+    }
+  }
+  return { data, rows, cols, binRows, binCols };
+}
+
+/**
  * @param {object} matrixA parsed matrix.json for Track A
  * @param {object} matrixB parsed matrix.json for Track B
- * @returns {{ jumpPoints: Array, beatTimesA: number[], beatTimesB: number[], bpmA: number, bpmB: number }}
+ * @param {{ maxHeatmapSize?: number }} [options]
+ * @returns {{
+ *   jumpPoints: Array,
+ *   beatTimesA: number[], beatTimesB: number[],
+ *   bpmA: number, bpmB: number,
+ *   heatmap: { data: number[][], rows: number, cols: number, binRows: number, binCols: number },
+ * }}
  */
-export function buildCrossTrackJumpMap(matrixA, matrixB) {
+export function buildCrossTrackJumpMap(matrixA, matrixB, { maxHeatmapSize = 160 } = {}) {
   const similarity = cosineSimilarityMatrix(
     matrixA.instrumental.features,
     matrixB.instrumental.features
@@ -117,5 +160,14 @@ export function buildCrossTrackJumpMap(matrixA, matrixB) {
     timeB: beatTimesB[p.beatB],
   }));
 
-  return { jumpPoints, beatTimesA, beatTimesB, bpmA: matrixA.bpm, bpmB: matrixB.bpm };
+  const heatmap = downsampleMatrix(similarity, maxHeatmapSize);
+
+  return {
+    jumpPoints,
+    beatTimesA,
+    beatTimesB,
+    bpmA: matrixA.bpm,
+    bpmB: matrixB.bpm,
+    heatmap,
+  };
 }

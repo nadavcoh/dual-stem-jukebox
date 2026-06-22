@@ -3,7 +3,6 @@ yt-dlp>=2024.8.6
 demucs>=4.0.1
 torch>=2.1.0
 librosa>=0.10.2
-scipy>=1.13.0
 numpy>=1.26.4
 soundfile>=0.12.1
 boto3>=1.34.0

@@ -2,21 +2,27 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { JukeboxEngine } from "@/lib/audioEngine";
-import { useAudioSync } from "@/hooks/useAudioSync";
+import { useWakeLock } from "@/hooks/useWakeLock";
 import { getPlaybackUrls } from "@/app/actions/presign";
+import TrackScrubber from "@/components/TrackScrubber";
+import JumpMatrix from "@/components/JumpMatrix";
 
 /**
  * @param {{
  *   trackA: { title: string, vocalsKey: string, instrumentalKey: string },
  *   trackB: { title: string, vocalsKey: string, instrumentalKey: string },
- *   jumpMap: { jumpPoints: Array, beatTimesA: number[], beatTimesB: number[], bpmA: number, bpmB: number },
+ *   jumpMap: {
+ *     jumpPoints: Array, beatTimesA: number[], beatTimesB: number[],
+ *     bpmA: number, bpmB: number,
+ *     heatmap: { data: number[][], rows: number, cols: number, binRows: number, binCols: number },
+ *   },
  * }} props
  */
 export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
   const engineRef = useRef(null);
   if (!engineRef.current) engineRef.current = new JukeboxEngine();
 
-  const [phase, setPhase] = useState("idle"); // idle | loading | ready | playing
+  const [phase, setPhase] = useState("idle"); // idle | loading | playing
   const [error, setError] = useState(null);
   const [mix, setMixState] = useState({
     aVocal: true,
@@ -24,20 +30,11 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
     bVocal: false,
     bInstrumental: false,
   });
-  const [autoJump, setAutoJump] = useState(false);
-  const [nowPlaying, setNowPlaying] = useState({ activeSlot: "a", activeBeatIndex: 0 });
 
-  const totalDuration =
-    nowPlaying.activeSlot === "a"
-      ? jumpMap.beatTimesA[jumpMap.beatTimesA.length - 1]
-      : jumpMap.beatTimesB[jumpMap.beatTimesB.length - 1];
-
-  const playheadRef = useAudioSync(engineRef, totalDuration);
-
-  useEffect(() => {
-    const unsubscribe = engineRef.current.onTick((state) => setNowPlaying(state));
-    return unsubscribe;
-  }, []);
+  // Keep the screen from locking/dimming while actually playing — a
+  // 3-4 minute demucs-separated mashup session is exactly the kind of
+  // thing that shouldn't get cut off by your phone's screen timeout.
+  useWakeLock(phase === "playing");
 
   useEffect(() => () => engineRef.current.stop(), []);
 
@@ -76,9 +73,8 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         }),
       ]);
 
-      engine.setJumpPoints(jumpMap.jumpPoints);
       engine.setActiveMix(mix);
-      engine.start("a", 0);
+      engine.start();
       setPhase("playing");
     } catch (err) {
       console.error(err);
@@ -89,35 +85,26 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
 
   const handleStop = useCallback(() => {
     engineRef.current.stop();
-    setPhase("ready");
+    setPhase("idle");
   }, []);
 
-  function toggleStem(key) {
+  function toggleMix(slot, stem) {
+    const key = `${slot}${stem[0].toUpperCase()}${stem.slice(1)}`; // "aVocal", "bInstrumental", etc.
     const next = { ...mix, [key]: !mix[key] };
     setMixState(next);
     if (phase === "playing") engineRef.current.setActiveMix(next);
   }
 
-  function handleAutoJumpToggle() {
-    const next = !autoJump;
-    setAutoJump(next);
-    engineRef.current.setAutoJump(next, 0.2, 0.92);
+  function handleApplyJump(jump) {
+    if (phase !== "playing") return;
+    engineRef.current.applyJumpPoint(jump);
   }
 
-  function handleManualJump() {
-    const candidates = jumpMap.jumpPoints;
-    if (!candidates.length) return;
-    const target = candidates[Math.floor(Math.random() * candidates.length)];
-    const toSlot = nowPlaying.activeSlot === "a" ? "b" : "a";
-    const toBeat = toSlot === "a" ? target.beatA : target.beatB;
-    engineRef.current.requestJump(toSlot, toBeat);
-  }
-
-  const activeSlotLabel = nowPlaying.activeSlot === "a" ? trackA.title : trackB.title;
+  const isPlaying = phase === "playing";
 
   return (
-    <div className="mx-auto w-full max-w-2xl rounded-xl border border-stone-800 bg-stone-950 p-5 text-stone-100">
-      <header className="mb-4 flex items-center justify-between">
+    <div className="mx-auto w-full max-w-2xl space-y-4 rounded-xl border border-stone-800 bg-stone-950 p-5 text-stone-100">
+      <header className="flex items-center justify-between">
         <div>
           <p className="font-mono text-[11px] uppercase tracking-widest text-stone-500">
             Dual-Stem Jukebox
@@ -128,40 +115,8 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
             <span className="text-orange-300">{trackB.title}</span>
           </h2>
         </div>
-        <div className="text-right font-mono text-xs text-stone-500">
-          <p>A {Math.round(jumpMap.bpmA)} bpm</p>
-          <p>B {Math.round(jumpMap.bpmB)} bpm</p>
-        </div>
-      </header>
 
-      {/* Beat-grid scrubber — playhead position comes from --playhead-pct,
-          written directly by useAudioSync on every animation frame. No
-          React state is involved in moving this line. */}
-      <div ref={playheadRef} className="relative mb-4 h-16 overflow-hidden rounded-md bg-stone-900">
-        <div className="absolute inset-0 flex items-center gap-px px-1 opacity-40">
-          {Array.from({ length: 64 }).map((_, i) => (
-            <div key={i} className="h-6 w-px flex-1 bg-stone-700" />
-          ))}
-        </div>
-        <div
-          className="absolute top-0 h-full w-0.5 bg-emerald-400 shadow-[0_0_8px_theme(colors.emerald.400)]"
-          style={{ left: "calc(var(--playhead-pct, 0) * 100%)" }}
-        />
-        <p className="absolute bottom-1 left-2 font-mono text-[10px] text-stone-500">
-          {activeSlotLabel} · beat {nowPlaying.activeBeatIndex}
-        </p>
-      </div>
-
-      {/* 4-track mix toggles */}
-      <div className="mb-4 grid grid-cols-4 gap-2">
-        <StemToggle label="Vocal A" active={mix.aVocal} color="cyan" onClick={() => toggleStem("aVocal")} />
-        <StemToggle label="Inst A" active={mix.aInstrumental} color="cyan" onClick={() => toggleStem("aInstrumental")} />
-        <StemToggle label="Vocal B" active={mix.bVocal} color="orange" onClick={() => toggleStem("bVocal")} />
-        <StemToggle label="Inst B" active={mix.bInstrumental} color="orange" onClick={() => toggleStem("bInstrumental")} />
-      </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        {phase === "playing" ? (
+        {isPlaying ? (
           <button
             onClick={handleStop}
             className="rounded-md bg-stone-100 px-4 py-2 text-sm font-medium text-stone-900"
@@ -174,50 +129,53 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
             disabled={phase === "loading"}
             className="rounded-md bg-gradient-to-r from-cyan-500 to-orange-500 px-4 py-2 text-sm font-semibold text-stone-950 disabled:opacity-50"
           >
-            {phase === "loading" ? "Decoding stems…" : "Load & Play"}
+            {phase === "loading" ? "Decoding…" : "Load & Play"}
           </button>
         )}
+      </header>
 
-        <button
-          onClick={handleManualJump}
-          disabled={phase !== "playing"}
-          className="rounded-md border border-stone-700 px-3 py-2 text-sm text-stone-200 disabled:opacity-40"
-        >
-          Jump now
-        </button>
-
-        <label className="ml-auto flex items-center gap-2 text-xs text-stone-400">
-          <input type="checkbox" checked={autoJump} onChange={handleAutoJumpToggle} />
-          Auto-jump
-        </label>
+      {/* Two fully independent decks — each seekable to any beat at any
+          time via its own scrubber, regardless of what the other is doing. */}
+      <div className={`space-y-3 ${isPlaying ? "" : "pointer-events-none opacity-50"}`}>
+        <TrackScrubber
+          slot="a"
+          label="Deck A"
+          accent="cyan"
+          title={trackA.title}
+          bpm={jumpMap.bpmA}
+          beatTimes={jumpMap.beatTimesA}
+          engineRef={engineRef}
+          mix={{ vocal: mix.aVocal, instrumental: mix.aInstrumental }}
+          onToggleMix={(stem) => toggleMix("a", stem)}
+        />
+        <TrackScrubber
+          slot="b"
+          label="Deck B"
+          accent="orange"
+          title={trackB.title}
+          bpm={jumpMap.bpmB}
+          beatTimes={jumpMap.beatTimesB}
+          engineRef={engineRef}
+          mix={{ vocal: mix.bVocal, instrumental: mix.bInstrumental }}
+          onToggleMix={(stem) => toggleMix("b", stem)}
+        />
       </div>
 
-      <p className="mt-3 font-mono text-[11px] text-stone-500">
-        {jumpMap.jumpPoints.length} jump point{jumpMap.jumpPoints.length === 1 ? "" : "s"} found between
-        these two tracks
-      </p>
+      <div className={isPlaying ? "" : "pointer-events-none opacity-50"}>
+        <JumpMatrix
+          heatmap={jumpMap.heatmap}
+          jumpPoints={jumpMap.jumpPoints}
+          beatTimesA={jumpMap.beatTimesA}
+          beatTimesB={jumpMap.beatTimesB}
+          engineRef={engineRef}
+          onApplyJump={handleApplyJump}
+        />
+      </div>
 
-      {error && <p className="mt-2 text-sm text-red-400">{error}</p>}
+      {!isPlaying && phase !== "loading" && (
+        <p className="text-center text-xs text-stone-500">Hit Load & Play to wake up both decks.</p>
+      )}
+      {error && <p className="text-center text-sm text-red-400">{error}</p>}
     </div>
-  );
-}
-
-function StemToggle({ label, active, color, onClick }) {
-  const colorClasses =
-    color === "cyan"
-      ? active
-        ? "border-cyan-400 bg-cyan-400/10 text-cyan-300"
-        : "border-stone-700 text-stone-500"
-      : active
-        ? "border-orange-400 bg-orange-400/10 text-orange-300"
-        : "border-stone-700 text-stone-500";
-
-  return (
-    <button
-      onClick={onClick}
-      className={`rounded-md border px-2 py-2 text-xs font-mono transition-colors ${colorClasses}`}
-    >
-      {label}
-    </button>
   );
 }

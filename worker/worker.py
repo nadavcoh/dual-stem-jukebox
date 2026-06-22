@@ -7,12 +7,18 @@ Polls Supabase for 'queued' tracks, claims one atomically via the
 
   1. Downloads audio with yt-dlp.
   2. Separates vocals / instrumental with demucs (2-stem).
-  3. Extracts beat-synchronous Chroma STFT + MFCC features per stem.
-  4. Builds a vocal<->instrumental cross-similarity matrix (cosine distance).
-  5. Filters that matrix for diagonally-coherent "jump points".
-  6. Uploads the mp3 stems + matrix.json to a private Backblaze B2 bucket
+  3. Extracts beat-synchronous Chroma STFT + MFCC features per stem and
+     stores them raw — these feed the *cross-track* (Track A <-> Track B)
+     similarity matrix built later, once a mashup is actually requested
+     (web/lib/crossTrackMatrix.js). There's no meaningful "jump point" to
+     compute from a single track's own vocal vs. its own instrumental —
+     they're different timbral content by construction (one's harmonic
+     vocal formants, the other's everything-but-vocals), so a high
+     cosine-similarity match between them isn't musically informative the
+     way a Track-A-vs-Track-B match is.
+  4. Uploads the mp3 stems + matrix.json to a private Backblaze B2 bucket
      and records their object keys (not public URLs).
-  7. Marks the row 'completed' (or 'failed') in Supabase.
+  5. Marks the row 'completed' (or 'failed') in Supabase.
 
 Run with:  python worker.py
 Stop with: Ctrl+C
@@ -32,7 +38,6 @@ import boto3
 import librosa
 import numpy as np
 from dotenv import load_dotenv
-from scipy.spatial.distance import cdist
 from supabase import Client, create_client
 from yt_dlp.utils import GeoRestrictedError
 
@@ -190,84 +195,6 @@ def extract_beat_features(audio_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# 4. Cross-similarity matrix (cosine distance)
-# ---------------------------------------------------------------------------
-def compute_similarity_matrix(features_a: np.ndarray, features_b: np.ndarray) -> np.ndarray:
-    """
-    Cosine-distance cross-similarity between every beat of stem A and every
-    beat of stem B. Returns a similarity matrix in [0, 1] (1.0 = identical
-    direction in feature space), shape (n_beats_a, n_beats_b).
-
-    This same function is reused, unmodified, at *mashup* time to build the
-    Track-A <-> Track-B jump map the JukeboxPlayer actually plays from — see
-    README "Cross-track mashup matrix" section.
-    """
-    distance = cdist(features_a, features_b, metric="cosine")
-    similarity = 1.0 - distance
-    return np.clip(similarity, 0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# 5. Filter for diagonal similarity sequences ("jump points")
-# ---------------------------------------------------------------------------
-def find_jump_points(
-    similarity: np.ndarray,
-    peak_threshold: float = 0.90,
-    neighbor_threshold: float = 0.82,
-    neighbor_radius: int = 2,
-    min_neighbor_hits: int = 3,
-    max_points: int = 200,
-):
-    """
-    A single high-similarity cell (i, j) is a coincidence as often as it is a
-    musically meaningful match. We only keep cells that are also part of a
-    short *diagonal* run of high similarity — i.e. (i-1, j-1), (i+1, j+1), etc.
-    are ALSO similar — because that means beats keep matching as the music
-    keeps playing, which is what makes a jump there sound seamless rather
-    than a single-frame glitch.
-    """
-    n, m = similarity.shape
-    candidates = np.argwhere(similarity >= peak_threshold)
-
-    points = []
-    for i, j in candidates:
-        hits = 0
-        checks = 0
-        for k in range(-neighbor_radius, neighbor_radius + 1):
-            if k == 0:
-                continue
-            ni, nj = i + k, j + k
-            if 0 <= ni < n and 0 <= nj < m:
-                checks += 1
-                if similarity[ni, nj] >= neighbor_threshold:
-                    hits += 1
-        if checks >= min_neighbor_hits and hits >= min_neighbor_hits:
-            points.append(
-                {
-                    "beat_a": int(i),
-                    "beat_b": int(j),
-                    "score": float(similarity[i, j]),
-                }
-            )
-
-    # Highest-confidence points first, then thin out points that are
-    # essentially duplicates of a better neighbor.
-    points.sort(key=lambda p: -p["score"])
-    kept = []
-    for p in points:
-        if any(
-            abs(p["beat_a"] - k["beat_a"]) <= 1 and abs(p["beat_b"] - k["beat_b"]) <= 1
-            for k in kept
-        ):
-            continue
-        kept.append(p)
-        if len(kept) >= max_points:
-            break
-
-    return kept
-
-
-# ---------------------------------------------------------------------------
 # 6. Upload to Backblaze B2
 # ---------------------------------------------------------------------------
 def upload_file(b2, local_path: Path, key: str) -> str:
@@ -337,20 +264,11 @@ def process_track(supabase: Client, b2, track: dict):
         # artifacts in solo vocals), so it's the more reliable BPM estimate.
         bpm = inst_bpm
 
-        # 4. Cross-similarity matrix between the two stems
-        similarity = compute_similarity_matrix(vocal_features, inst_features)
-
-        # 5. Diagonal-coherent jump points
-        jump_points = find_jump_points(similarity)
-        jump_points_with_time = [
-            {
-                **p,
-                "time_vocal": float(vocal_beats[p["beat_a"]]),
-                "time_instrumental": float(inst_beats[p["beat_b"]]),
-            }
-            for p in jump_points
-        ]
-
+        # 4. Beat-synchronous features for each stem — stored raw. The
+        # similarity matrix that actually matters (Track A's instrumental
+        # vs. Track B's instrumental) can only be built once you know which
+        # two tracks you're mashing up, so that happens later, client-side
+        # of a mashup request — see web/lib/crossTrackMatrix.js.
         matrix_payload = {
             "youtube_id": youtube_id,
             "bpm": bpm,
@@ -362,19 +280,18 @@ def process_track(supabase: Client, b2, track: dict):
                 "beat_times": inst_beats.tolist(),
                 "features": inst_features.tolist(),
             },
-            "jump_points": jump_points_with_time,
         }
 
         matrix_path = job_dir / "matrix.json"
         matrix_path.write_text(json.dumps(matrix_payload))
 
-        # 6. Upload to B2 — keyed by youtube_id so storage stays organized
+        # 5. Upload to B2 — keyed by youtube_id so storage stays organized
         # by song regardless of which Supabase row (re-)triggered the job.
         vocals_key = upload_file(b2, vocals_mp3, f"{youtube_id}/vocals.mp3")
         instrumental_key = upload_file(b2, instrumental_mp3, f"{youtube_id}/instrumental.mp3")
         matrix_json_key = upload_file(b2, matrix_path, f"{youtube_id}/matrix.json")
 
-        # 7. Mark completed
+        # 6. Mark completed
         supabase.table("tracks").update(
             {
                 "status": "completed",

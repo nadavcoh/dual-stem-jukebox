@@ -28,12 +28,15 @@ dual-stem-jukebox/
     │   ├── Workbench.jsx          # tab switcher: Add Songs / Build Mashup
     │   ├── TrackSearch.jsx        # "Add Songs" tab — search + request processing
     │   ├── MashupLibrary.jsx      # "Build Mashup" tab — pick 2 completed tracks
-    │   └── JukeboxPlayer.jsx
+    │   ├── JukeboxPlayer.jsx      # wires the two decks + matrix + wake lock together
+    │   ├── TrackScrubber.jsx      # one deck's timeline — click anywhere to seek it
+    │   └── JumpMatrix.jsx         # canvas heatmap of the full similarity matrix
     ├── hooks/
-    │   └── useAudioSync.js
+    │   ├── useAudioSync.js        # per-deck playhead -> CSS var, no React state
+    │   └── useWakeLock.js         # keeps the screen on during playback
     ├── lib/
-    │   ├── audioEngine.js        # JukeboxEngine — the Web Audio scheduler/router
-    │   ├── crossTrackMatrix.js   # cosine-similarity + diagonal jump-point filter (JS port)
+    │   ├── audioEngine.js        # JukeboxEngine — two independent, freely-seekable decks
+    │   ├── crossTrackMatrix.js   # cosine-similarity + diagonal jump-point filter + heatmap downsampling
     │   ├── youtubePlayability.js # best-effort region-block check for search results
     │   ├── b2Presign.js          # read-only S3 client + presigned URL helpers (private bucket)
     │   ├── supabaseClient.js     # publishable key, browser
@@ -61,35 +64,45 @@ dual-stem-jukebox/
 3. **Process (off-platform)** — your local `worker.py` polls
    `claim_next_track()`, which uses `SELECT ... FOR UPDATE SKIP LOCKED` so
    multiple workers never grab the same job. It downloads the audio
-   (`yt-dlp`), separates stems (`demucs`, 2-stem), extracts beat-synchronous
-   Chroma+MFCC features (`librosa`), computes a vocal↔instrumental
-   cross-similarity matrix (`scipy.spatial.distance.cdist`, cosine), filters
-   it for diagonally-coherent jump points, uploads the mp3 stems and a
-   `matrix.json` to a **private** Backblaze B2 bucket (`boto3`, read-write
-   key), and marks the row `'completed'` with their **object keys**
-   (`{youtube_id}/vocals.mp3`, etc.) — not public URLs, since the bucket
-   isn't public. A video that's blocked in the worker's region gets a clean
-   one-line `GEO-BLOCKED` log and `status='failed'` instead of a traceback —
-   that's an expected outcome, not a bug, and the only place that knows for
-   certain (the pre-filter in step 1 is best-effort, this is authoritative).
-4. **Build the real jump map** — `matrix.json` stores each track's raw
-   beat-synced features, not just its self jump points. When you open
-   `/jukebox/[idA]/[idB]`, the Server Component exchanges each track's
-   `matrix_json_key` for a short-lived presigned URL (`lib/b2Presign.js`,
-   using a separate **read-only** B2 key), fetches both, and calls
-   `buildCrossTrackJumpMap()` (`lib/crossTrackMatrix.js`) — the same
-   cosine-distance + diagonal-filter algorithm as the worker, reimplemented
-   in JS — to find beats where Track A and Track B's *instrumentals* line
-   up. That's the jump map the player actually plays from.
-5. **Play** — `JukeboxPlayer` receives `vocalsKey`/`instrumentalKey` (not
-   URLs) as props. Right before it starts decoding, it calls the
-   `getPlaybackUrls` Server Action (`app/actions/presign.js`) to exchange
-   those four keys for presigned URLs *just in time* — generating them this
-   late, rather than back when the page first rendered, means they can't
-   expire before someone actually hits play. Only then does it hand the
-   resolved URLs to `JukeboxEngine` (`lib/audioEngine.js`) and start its
-   lookahead scheduler. `useAudioSync` paints the playhead via a CSS
-   variable on every `requestAnimationFrame`, never touching React state.
+   (`yt-dlp`), separates stems (`demucs`, 2-stem), and extracts
+   beat-synchronous Chroma+MFCC features (`librosa`) for *each* stem,
+   storing them raw in `matrix.json`. It deliberately does **not** compute
+   a vocal-vs-instrumental similarity matrix for the track's own two stems
+   anymore — they're different timbral content by construction (harmonic
+   vocal formants vs. everything-but-vocals), so a high cosine-similarity
+   match between them was never musically meaningful; the matrix that
+   actually matters can only be built once you know *which two tracks*
+   you're mashing up (next step). Uploads the mp3 stems + `matrix.json` to
+   a **private** B2 bucket and marks the row `'completed'` with their
+   **object keys**, not public URLs. A video blocked in the worker's
+   region gets a clean one-line `GEO-BLOCKED` log instead of a traceback —
+   expected, not a bug, and the only fully authoritative check (the
+   pre-filter in step 1 is best-effort).
+4. **Build the real jump map** — when you open `/jukebox/[idA]/[idB]`, the
+   Server Component exchanges each track's `matrix_json_key` for a
+   presigned URL, fetches both `matrix.json` files, and calls
+   `buildCrossTrackJumpMap()` (`lib/crossTrackMatrix.js`) — cosine
+   similarity between Track A's and Track B's *instrumental* features,
+   filtered for diagonally-coherent runs (a lone high-similarity cell is a
+   coincidence; a short run of them as the music keeps playing is a real
+   match) — to find beats where the two songs line up. This also returns a
+   downsampled (max 160×160) version of the *full* similarity matrix for
+   the heatmap, via max-pooling so sparse bright spots survive the
+   downsampling instead of getting averaged away.
+5. **Play** — `JukeboxPlayer` resolves the four stem keys to presigned URLs
+   just before decoding (so they can't expire while you were still
+   deciding whether to hit play), then hands them to `JukeboxEngine`
+   (`lib/audioEngine.js`) — two **completely independent** decks, each
+   running its own lookahead scheduler from the moment you hit Load & Play
+   until you stop. Each `TrackScrubber` is a click-anywhere-to-seek
+   timeline for its own deck only; `JumpMatrix` renders the actual
+   similarity field as a heatmap with the algorithm's validated jump
+   points marked in green and a live two-color crosshair showing both
+   decks' real-time position in that 2D space — click anywhere on it
+   (not just the green dots) to send both decks there at once.
+   `useAudioSync` paints each playhead via a CSS variable on every
+   `requestAnimationFrame`, never touching React state; `useWakeLock`
+   keeps the screen from locking mid-mashup.
 
 ## Setup
 
