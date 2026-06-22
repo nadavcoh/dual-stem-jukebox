@@ -20,9 +20,13 @@
  *    vocoder, out of scope for a plain AudioBufferSourceNode); it shifts
  *    pitch slightly, proportional to the BPM ratio. Honest tradeoff, not
  *    a bug.
- *  - Auto Jump: every N beats, take a random high-scoring jump point.
- *  - Auto Switch Stems: every N beats, rotate to a different vocal/
- *    instrumental combination.
+ *  - Auto Jump: every N beats, take a jump point — picked with probability
+ *    weighted by score, both in *whether* a jump happens at all at that
+ *    checkpoint and *which* candidate gets taken if so.
+ *  - Auto Switch Stems: coupled to jumps, not its own timer — every time
+ *    a jump happens (auto or manual), rotate to a different vocal/
+ *    instrumental combination, weighted toward the two classic mashup
+ *    moves (one song's vocal over the other's beat).
  *
  * Routing graph (persistent for the life of the engine):
  *
@@ -55,16 +59,30 @@ const STEMS = ["vocal", "instrumental"];
 
 // Curated combinations for auto-switch — deliberately not every possible
 // on/off permutation, so it never lands on dead silence and always picks
-// something that reads as an intentional mashup move.
+// something that reads as an intentional mashup move. Weighted toward the
+// two "classic" combos (one song's vocal over the other's instrumental) —
+// that's the canonical mashup move; the rest are flavor, not the default.
 const AUTO_SWITCH_COMBOS = [
-  { aVocal: true, aInstrumental: true, bVocal: false, bInstrumental: false }, // Track A solo
-  { aVocal: false, aInstrumental: false, bVocal: true, bInstrumental: true }, // Track B solo
-  { aVocal: true, aInstrumental: false, bVocal: false, bInstrumental: true }, // classic mashup: A's vocal over B's beat
-  { aVocal: false, aInstrumental: true, bVocal: true, bInstrumental: false }, // the reverse
-  { aVocal: true, aInstrumental: true, bVocal: true, bInstrumental: true }, // full collision
-  { aVocal: true, aInstrumental: false, bVocal: true, bInstrumental: false }, // both vocals, no beat
-  { aVocal: false, aInstrumental: true, bVocal: false, bInstrumental: true }, // both instrumentals
+  { weight: 3, combo: { aVocal: true, aInstrumental: false, bVocal: false, bInstrumental: true } }, // classic: A's vocal over B's beat
+  { weight: 3, combo: { aVocal: false, aInstrumental: true, bVocal: true, bInstrumental: false } }, // the reverse
+  { weight: 1, combo: { aVocal: true, aInstrumental: true, bVocal: false, bInstrumental: false } }, // Track A solo
+  { weight: 1, combo: { aVocal: false, aInstrumental: false, bVocal: true, bInstrumental: true } }, // Track B solo
+  { weight: 1, combo: { aVocal: true, aInstrumental: true, bVocal: true, bInstrumental: true } }, // full collision
+  { weight: 1, combo: { aVocal: true, aInstrumental: false, bVocal: true, bInstrumental: false } }, // both vocals, no beat
+  { weight: 1, combo: { aVocal: false, aInstrumental: true, bVocal: false, bInstrumental: true } }, // both instrumentals
 ];
+
+/** Weighted random pick — `weightFn(item)` returns a non-negative weight. */
+function weightedPick(items, weightFn) {
+  const weights = items.map(weightFn);
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  let roll = Math.random() * total;
+  for (let i = 0; i < items.length; i++) {
+    roll -= weights[i];
+    if (roll <= 0) return items[i];
+  }
+  return items[items.length - 1]; // floating-point edge case fallback
+}
 
 export class JukeboxEngine {
   constructor() {
@@ -104,8 +122,10 @@ export class JukeboxEngine {
 
     // Jump points (from lib/crossTrackMatrix.js), used by auto-jump.
     this.jumpPoints = [];
-    this.autoJump = { enabled: false, everyNBeats: 16, minScore: 0.9 };
-    this.autoStemSwitch = { enabled: false, everyNBeats: 8 };
+    this.autoJump = { enabled: false, everyNBeats: 16, minScore: 0.9, scoreExponent: 2 };
+    // No timer of its own — stems only ever switch as a side effect of a
+    // jump (auto or manual), never independently. See applyJumpPoint().
+    this.autoStemSwitch = { enabled: false };
     // Master clock for both auto-behaviors' cadence — counts Deck A's
     // forward-scheduled beats specifically (not affected by jumps/seeks),
     // so "every N beats" means elapsed real playback, not buffer position.
@@ -230,37 +250,57 @@ export class JukeboxEngine {
     this.jumpPoints = jumpPoints ?? [];
   }
 
-  setAutoJump({ enabled, everyNBeats, minScore } = {}) {
+  setAutoJump({ enabled, everyNBeats, minScore, scoreExponent } = {}) {
     this.autoJump = {
       enabled: enabled ?? this.autoJump.enabled,
       everyNBeats: everyNBeats ?? this.autoJump.everyNBeats,
       minScore: minScore ?? this.autoJump.minScore,
+      scoreExponent: scoreExponent ?? this.autoJump.scoreExponent,
     };
   }
 
-  setAutoStemSwitch({ enabled, everyNBeats } = {}) {
-    this.autoStemSwitch = {
-      enabled: enabled ?? this.autoStemSwitch.enabled,
-      everyNBeats: everyNBeats ?? this.autoStemSwitch.everyNBeats,
-    };
+  setAutoStemSwitch({ enabled } = {}) {
+    this.autoStemSwitch = { enabled: enabled ?? this.autoStemSwitch.enabled };
   }
 
+  /**
+   * Every `everyNBeats`, decides whether to jump at all, and if so, which
+   * candidate to take — both decisions weighted by score, not uniform.
+   *
+   * Candidates are filtered to score >= minScore, then each gets a weight
+   * of score^scoreExponent (default exponent 2, so the preference for
+   * strong matches over merely-adequate ones is more than linear). The
+   * best candidate's weight also sets the chance that *anything* happens
+   * at this checkpoint at all: a near-perfect match (0.98) skips this
+   * checkpoint only ~4% of the time; a borderline one right at minScore
+   * (say 0.91 with minScore 0.9) skips ~17% of the time. Concretely: the
+   * "skip" outcome gets weight (1 - bestWeight), competing in the same
+   * weighted draw as the real candidates.
+   */
   _maybeAutoJump() {
-    const { enabled, everyNBeats, minScore } = this.autoJump;
+    const { enabled, everyNBeats, minScore, scoreExponent } = this.autoJump;
     if (!enabled || this.jumpPoints.length === 0) return;
     if (this._beatCounter % everyNBeats !== 0) return;
+
     const candidates = this.jumpPoints.filter((p) => p.score >= minScore);
     if (!candidates.length) return;
-    const pick = candidates[Math.floor(Math.random() * candidates.length)];
-    this.applyJumpPoint(pick);
-  }
 
-  _maybeAutoSwitchStems() {
-    const { enabled, everyNBeats } = this.autoStemSwitch;
-    if (!enabled) return;
-    if (this._beatCounter % everyNBeats !== 0) return;
-    const next = AUTO_SWITCH_COMBOS[Math.floor(Math.random() * AUTO_SWITCH_COMBOS.length)];
-    this.setActiveMix(next);
+    const weights = candidates.map((p) => p.score ** scoreExponent);
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    const bestWeight = Math.max(...weights);
+    const skipWeight = Math.max(1 - bestWeight, 0);
+
+    let roll = Math.random() * (totalWeight + skipWeight);
+    if (roll >= totalWeight) return; // skipped this checkpoint
+
+    for (let i = 0; i < candidates.length; i++) {
+      roll -= weights[i];
+      if (roll <= 0) {
+        this.applyJumpPoint(candidates[i]);
+        return;
+      }
+    }
+    this.applyJumpPoint(candidates[candidates.length - 1]); // floating-point edge case
   }
 
   // -------------------------------------------------------------------
@@ -333,10 +373,20 @@ export class JukeboxEngine {
     this._notify();
   }
 
-  /** Convenience: seek both decks to a matched (beatA, beatB) pair at once. */
+  /**
+   * Convenience: seek both decks to a matched (beatA, beatB) pair at once.
+   * If Auto Switch Stems is enabled, this is also the ONLY place stems
+   * switch — there's no independent timer for it. Switching the mix at
+   * the same moment as a position jump is what makes it read as one
+   * deliberate mashup move instead of two unrelated random events.
+   */
   applyJumpPoint({ beatA, beatB }) {
     this.seekTo("a", beatA);
     this.seekTo("b", beatB);
+    if (this.autoStemSwitch.enabled) {
+      const { combo } = weightedPick(AUTO_SWITCH_COMBOS, (c) => c.weight);
+      this.setActiveMix(combo);
+    }
   }
 
   _schedulerTick() {
@@ -376,7 +426,6 @@ export class JukeboxEngine {
     if (slot === "a") {
       this._beatCounter += 1;
       this._maybeAutoJump();
-      this._maybeAutoSwitchStems();
     }
     this._notify();
   }

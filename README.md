@@ -110,18 +110,23 @@ dual-stem-jukebox/
      pitch-corrected time-stretching — it shifts Deck B's pitch by
      whatever the BPM ratio is. The UI shows the actual percentage so
      it's never a mystery.
-   - **Auto jump** — every 16 of Deck A's beats, takes a random jump point
-     scoring ≥ 0.9, via the same `applyJumpPoint()` a matrix click uses.
-   - **Auto switch stems** — every 8 of Deck A's beats, rotates to a
-     different vocal/instrumental combination from a small curated set
-     (deliberately not every on/off permutation, so it never lands on
-     silence).
+   - **Auto jump** — every 16 of Deck A's beats, weighs whether to jump at
+     all and which candidate to take by `score²`: a near-perfect match
+     (0.98) gets taken almost every time it comes up; a borderline one
+     right at the 0.9 cutoff skips roughly 1 time in 6. Same
+     `applyJumpPoint()` a matrix click uses.
+   - **Auto switch stems** — has no timer of its own. It switches *only*
+     as a side effect of a jump (auto or manual click on the matrix) —
+     never independently — weighted 3:1 toward the two classic mashup
+     moves (one song's vocal over the other's beat) over the other five
+     curated combinations.
 
-   Both auto-behaviors are engine-internal, counted off Deck A's own beat
-   clock — `lib/audioEngine.js`'s `_beatCounter`. The mix is now
-   engine-owned state for this reason: once auto-switch can change it from
-   inside the engine, React can't be the source of truth for it anymore —
-   `JukeboxPlayer` mirrors it via `onTick()` instead of holding it locally.
+   Both auto-behaviors live in `applyJumpPoint()` / `_maybeAutoJump()` in
+   `lib/audioEngine.js`, counted off Deck A's own beat clock
+   (`_beatCounter`). The mix is engine-owned state for this reason: once
+   auto-switch can change it from inside the engine, React can't be the
+   source of truth for it anymore — `JukeboxPlayer` mirrors it via
+   `onTick()` instead of holding it locally.
 
 ## Setup
 
