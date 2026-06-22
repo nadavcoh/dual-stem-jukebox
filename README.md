@@ -103,6 +103,25 @@ dual-stem-jukebox/
    `useAudioSync` paints each playhead via a CSS variable on every
    `requestAnimationFrame`, never touching React state; `useWakeLock`
    keeps the screen from locking mid-mashup.
+6. **Optional automatic behaviors** — three toggles, all off by default:
+   - **Beat sync** — vari-speed beatmatching: Deck B's `playbackRate` is
+     set to `bpmA / bpmB` so its beats land in time with Deck A's. This
+     is the same technique a turntable's pitch fader uses, **not**
+     pitch-corrected time-stretching — it shifts Deck B's pitch by
+     whatever the BPM ratio is. The UI shows the actual percentage so
+     it's never a mystery.
+   - **Auto jump** — every 16 of Deck A's beats, takes a random jump point
+     scoring ≥ 0.9, via the same `applyJumpPoint()` a matrix click uses.
+   - **Auto switch stems** — every 8 of Deck A's beats, rotates to a
+     different vocal/instrumental combination from a small curated set
+     (deliberately not every on/off permutation, so it never lands on
+     silence).
+
+   Both auto-behaviors are engine-internal, counted off Deck A's own beat
+   clock — `lib/audioEngine.js`'s `_beatCounter`. The mix is now
+   engine-owned state for this reason: once auto-switch can change it from
+   inside the engine, React can't be the source of truth for it anymore —
+   `JukeboxPlayer` mirrors it via `onTick()` instead of holding it locally.
 
 ## Setup
 

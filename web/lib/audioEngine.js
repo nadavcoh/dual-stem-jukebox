@@ -9,12 +9,20 @@
  * its own transport (vocal + instrumental together, since they share one
  * timeline) from the moment you hit play until you stop. Each deck can be
  * seek()'d to any beat, at any moment, completely independently of the
- * other — there's no single "active" deck anymore. What's actually
- * *audible* (vocal/instrumental, A/B) is a separate concern, controlled by
- * the persistent routing-graph gain nodes below; transport position and
- * audibility don't have to agree, by design — that's what lets you e.g.
- * scrub deck B around while only deck A is currently audible, to line up
- * your next move before committing to it.
+ * other. What's actually *audible* (vocal/instrumental, A/B) is a separate
+ * concern, controlled by the persistent routing-graph gain nodes below.
+ *
+ * On top of that manual control, three optional automatic behaviors:
+ *
+ *  - Beat Sync: vari-speed beatmatching via playbackRate, locking Deck B's
+ *    tempo to Deck A's — the same technique a turntable pitch fader uses.
+ *    This is NOT pitch-corrected time-stretching (that needs a phase
+ *    vocoder, out of scope for a plain AudioBufferSourceNode); it shifts
+ *    pitch slightly, proportional to the BPM ratio. Honest tradeoff, not
+ *    a bug.
+ *  - Auto Jump: every N beats, take a random high-scoring jump point.
+ *  - Auto Switch Stems: every N beats, rotate to a different vocal/
+ *    instrumental combination.
  *
  * Routing graph (persistent for the life of the engine):
  *
@@ -34,8 +42,7 @@
  * Wilson, "A Tale of Two Clocks"): a cheap setInterval polls how far each
  * deck is from its next beat boundary, and schedules audio events slightly
  * ahead of time using the audio clock (audioCtx.currentTime) — never the
- * setInterval clock itself — which is what keeps everything sample-accurate
- * regardless of UI-thread jitter.
+ * setInterval clock itself.
  */
 
 const SCHEDULE_AHEAD_SECONDS = 0.1;
@@ -46,6 +53,19 @@ const SEEK_LEAD_SECONDS = 0.05; // safety margin so a seek never schedules in th
 const SLOTS = ["a", "b"];
 const STEMS = ["vocal", "instrumental"];
 
+// Curated combinations for auto-switch — deliberately not every possible
+// on/off permutation, so it never lands on dead silence and always picks
+// something that reads as an intentional mashup move.
+const AUTO_SWITCH_COMBOS = [
+  { aVocal: true, aInstrumental: true, bVocal: false, bInstrumental: false }, // Track A solo
+  { aVocal: false, aInstrumental: false, bVocal: true, bInstrumental: true }, // Track B solo
+  { aVocal: true, aInstrumental: false, bVocal: false, bInstrumental: true }, // classic mashup: A's vocal over B's beat
+  { aVocal: false, aInstrumental: true, bVocal: true, bInstrumental: false }, // the reverse
+  { aVocal: true, aInstrumental: true, bVocal: true, bInstrumental: true }, // full collision
+  { aVocal: true, aInstrumental: false, bVocal: true, bInstrumental: false }, // both vocals, no beat
+  { aVocal: false, aInstrumental: true, bVocal: false, bInstrumental: true }, // both instrumentals
+];
+
 export class JukeboxEngine {
   constructor() {
     this.ctx = null;
@@ -55,9 +75,15 @@ export class JukeboxEngine {
     this.buffers = { a: {}, b: {} };
     // { a: number[], b: number[] } beat onset times in seconds
     this.beatTimes = { a: [], b: [] };
+    // { a: number, b: number } BPM, used for Beat Sync's rate calculation
+    this.bpm = { a: null, b: null };
 
     // Persistent routing graph gain nodes: this.gainNodes.a.vocal, etc.
     this.gainNodes = { a: {}, b: {} };
+    // Authoritative current mix — the engine owns this now (not React),
+    // since auto-switch-stems changes it from inside here. getState()
+    // reports it back out for the UI to mirror.
+    this.activeMix = { a: { vocal: true, instrumental: true }, b: { vocal: false, instrumental: false } };
 
     // Each deck's own transport state — independent of the other deck.
     this.transports = {
@@ -69,6 +95,21 @@ export class JukeboxEngine {
     // segments — needed so seekTo() can fade out exactly what's currently
     // queued for that slot without touching the other slot at all.
     this.slotSources = { a: [], b: [] };
+
+    // Beat Sync: playback rate per deck. Deck A is always the tempo
+    // reference (rate 1); Deck B's rate is recomputed from the BPM ratio
+    // whenever sync is toggled on or new tracks are loaded.
+    this.beatSyncEnabled = false;
+    this.rates = { a: 1, b: 1 };
+
+    // Jump points (from lib/crossTrackMatrix.js), used by auto-jump.
+    this.jumpPoints = [];
+    this.autoJump = { enabled: false, everyNBeats: 16, minScore: 0.9 };
+    this.autoStemSwitch = { enabled: false, everyNBeats: 8 };
+    // Master clock for both auto-behaviors' cadence — counts Deck A's
+    // forward-scheduled beats specifically (not affected by jumps/seeks),
+    // so "every N beats" means elapsed real playback, not buffer position.
+    this._beatCounter = 0;
 
     this._timer = null;
     this._listeners = new Set();
@@ -89,11 +130,7 @@ export class JukeboxEngine {
       for (const slot of SLOTS) {
         for (const stem of STEMS) {
           const gain = this.ctx.createGain();
-          // Sensible starting point: Track A fully audible, Track B muted.
-          // JukeboxPlayer calls setActiveMix() right after load with the
-          // user's actual choice — this is just the value in the brief
-          // window before that.
-          gain.gain.value = slot === "a" ? 1 : 0;
+          gain.gain.value = this.activeMix[slot][stem] ? 1 : 0;
           gain.connect(this.masterGain);
           this.gainNodes[slot][stem] = gain;
         }
@@ -111,9 +148,9 @@ export class JukeboxEngine {
 
   /**
    * @param {"a"|"b"} slot
-   * @param {{vocalsUrl: string, instrumentalUrl: string, beatTimes: number[]}} data
+   * @param {{vocalsUrl: string, instrumentalUrl: string, beatTimes: number[], bpm?: number}} data
    */
-  async loadTrack(slot, { vocalsUrl, instrumentalUrl, beatTimes }) {
+  async loadTrack(slot, { vocalsUrl, instrumentalUrl, beatTimes, bpm }) {
     this.ensureContext();
     const [vocal, instrumental] = await Promise.all([
       this._decode(vocalsUrl),
@@ -121,6 +158,8 @@ export class JukeboxEngine {
     ]);
     this.buffers[slot] = { vocal, instrumental };
     this.beatTimes[slot] = beatTimes;
+    this.bpm[slot] = bpm ?? null;
+    this._recomputeRates();
   }
 
   // -------------------------------------------------------------------
@@ -135,14 +174,93 @@ export class JukeboxEngine {
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
     gain.gain.linearRampToValueAtTime(level, now + rampSeconds);
+    this.activeMix[slot][stem] = level > 0;
+    this._notify();
   }
 
   /** Switch which song's stems are audible (e.g. "Vocal A + Instrumental B" mashup toggles). */
   setActiveMix({ aVocal, aInstrumental, bVocal, bInstrumental }) {
-    this.setMix("a", "vocal", aVocal ? 1 : 0);
-    this.setMix("a", "instrumental", aInstrumental ? 1 : 0);
-    this.setMix("b", "vocal", bVocal ? 1 : 0);
-    this.setMix("b", "instrumental", bInstrumental ? 1 : 0);
+    const targets = [
+      ["a", "vocal", aVocal],
+      ["a", "instrumental", aInstrumental],
+      ["b", "vocal", bVocal],
+      ["b", "instrumental", bInstrumental],
+    ];
+    for (const [slot, stem, on] of targets) {
+      const gain = this.gainNodes[slot]?.[stem];
+      if (!gain) continue;
+      const now = this.ctx.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(gain.gain.value, now);
+      gain.gain.linearRampToValueAtTime(on ? 1 : 0, now + 0.05);
+      this.activeMix[slot][stem] = Boolean(on);
+    }
+    this._notify();
+  }
+
+  // -------------------------------------------------------------------
+  // Beat Sync (vari-speed beatmatching — shifts pitch, not pitch-corrected)
+  // -------------------------------------------------------------------
+
+  setBeatSync(enabled) {
+    this.beatSyncEnabled = enabled;
+    this._recomputeRates();
+    this._notify();
+  }
+
+  _recomputeRates() {
+    if (this.beatSyncEnabled && this.bpm.a && this.bpm.b) {
+      this.rates = { a: 1, b: this.bpm.a / this.bpm.b };
+    } else {
+      this.rates = { a: 1, b: 1 };
+    }
+  }
+
+  /** Deck B's current pitch shift from Beat Sync, as a +/- percentage, for display. */
+  getPitchShiftPercent(slot) {
+    return (this.rates[slot] - 1) * 100;
+  }
+
+  // -------------------------------------------------------------------
+  // Jump points + auto-behaviors
+  // -------------------------------------------------------------------
+
+  /** jumpPoints: [{ beatA, beatB, score }] indices into beatTimes.a / beatTimes.b */
+  setJumpPoints(jumpPoints) {
+    this.jumpPoints = jumpPoints ?? [];
+  }
+
+  setAutoJump({ enabled, everyNBeats, minScore } = {}) {
+    this.autoJump = {
+      enabled: enabled ?? this.autoJump.enabled,
+      everyNBeats: everyNBeats ?? this.autoJump.everyNBeats,
+      minScore: minScore ?? this.autoJump.minScore,
+    };
+  }
+
+  setAutoStemSwitch({ enabled, everyNBeats } = {}) {
+    this.autoStemSwitch = {
+      enabled: enabled ?? this.autoStemSwitch.enabled,
+      everyNBeats: everyNBeats ?? this.autoStemSwitch.everyNBeats,
+    };
+  }
+
+  _maybeAutoJump() {
+    const { enabled, everyNBeats, minScore } = this.autoJump;
+    if (!enabled || this.jumpPoints.length === 0) return;
+    if (this._beatCounter % everyNBeats !== 0) return;
+    const candidates = this.jumpPoints.filter((p) => p.score >= minScore);
+    if (!candidates.length) return;
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    this.applyJumpPoint(pick);
+  }
+
+  _maybeAutoSwitchStems() {
+    const { enabled, everyNBeats } = this.autoStemSwitch;
+    if (!enabled) return;
+    if (this._beatCounter % everyNBeats !== 0) return;
+    const next = AUTO_SWITCH_COMBOS[Math.floor(Math.random() * AUTO_SWITCH_COMBOS.length)];
+    this.setActiveMix(next);
   }
 
   // -------------------------------------------------------------------
@@ -158,6 +276,7 @@ export class JukeboxEngine {
       b: { beatIndex: 0, nextStartTime: lead },
     };
     this.slotSources = { a: [], b: [] };
+    this._beatCounter = 0;
     this._timer = setInterval(() => this._schedulerTick(), TICK_INTERVAL_MS);
   }
 
@@ -193,10 +312,8 @@ export class JukeboxEngine {
 
     const clamped = Math.max(0, Math.min(beatIndex, beats.length - 2));
     const now = this.ctx.currentTime + SEEK_LEAD_SECONDS;
+    const rate = this.rates[slot] ?? 1;
 
-    // Fade out + cut short anything already sounding/queued for this slot
-    // that would otherwise still be playing at `now`. Already-finished
-    // segments are left alone (they're already disconnected via onended).
     for (const entry of this.slotSources[slot]) {
       if (entry.end <= now) continue;
       try {
@@ -212,7 +329,7 @@ export class JukeboxEngine {
     const { start, duration } = this._segmentBounds(slot, clamped);
     this._playSegment(slot, start, duration, now, CROSSFADE_SECONDS);
 
-    this.transports[slot] = { beatIndex: clamped + 1, nextStartTime: now + duration };
+    this.transports[slot] = { beatIndex: clamped + 1, nextStartTime: now + duration / rate };
     this._notify();
   }
 
@@ -244,6 +361,7 @@ export class JukeboxEngine {
   _scheduleForwardBeat(slot) {
     const t = this.transports[slot];
     const { start, duration } = this._segmentBounds(slot, t.beatIndex);
+    const rate = this.rates[slot] ?? 1;
 
     // Plain back-to-back scheduling, no fade: consecutive beats within the
     // same track are literally adjacent samples in the original recording,
@@ -253,17 +371,27 @@ export class JukeboxEngine {
 
     t.beatIndex += 1;
     if (t.beatIndex >= this.beatTimes[slot].length - 1) t.beatIndex = 0; // loop the song
-    t.nextStartTime += duration;
+    t.nextStartTime += duration / rate;
+
+    if (slot === "a") {
+      this._beatCounter += 1;
+      this._maybeAutoJump();
+      this._maybeAutoSwitchStems();
+    }
     this._notify();
   }
 
   _playSegment(slot, offset, duration, when, fadeInDuration) {
+    const rate = this.rates[slot] ?? 1;
+    const effectiveDuration = duration / rate;
+
     for (const stem of STEMS) {
       const buffer = this.buffers[slot][stem];
       if (!buffer) continue;
 
       const source = this.ctx.createBufferSource();
       source.buffer = buffer;
+      source.playbackRate.value = rate;
 
       const segmentGain = this.ctx.createGain();
       source.connect(segmentGain);
@@ -276,10 +404,13 @@ export class JukeboxEngine {
         segmentGain.gain.setValueAtTime(1, when);
       }
 
+      // start()'s duration argument is in the buffer's own time, unaffected
+      // by playbackRate — but the real wall-clock time this occupies IS
+      // affected, which is what stop()/our bookkeeping need to use.
       source.start(when, Math.max(offset, 0), duration);
-      source.stop(when + duration + CROSSFADE_SECONDS + 0.01);
+      source.stop(when + effectiveDuration + CROSSFADE_SECONDS + 0.01);
 
-      const entry = { source, segmentGain, end: when + duration };
+      const entry = { source, segmentGain, end: when + effectiveDuration };
       source.onended = () => {
         try {
           source.disconnect();
@@ -297,24 +428,29 @@ export class JukeboxEngine {
   // UI sync (no React here — see hooks/useAudioSync.js)
   // -------------------------------------------------------------------
 
-  /** Best-effort current playhead, in seconds, for the given deck. */
+  /** Best-effort current playhead, in *buffer* seconds, for the given deck. */
   getPlayheadSeconds(slot) {
     if (!this.ctx) return 0;
     const t = this.transports[slot];
     if (!t) return 0;
-    // nextStartTime always points at this deck's *upcoming* boundary, so
-    // the segment currently sounding on this deck started one beat
-    // duration before it.
+    const rate = this.rates[slot] ?? 1;
     const { start, duration } = this._segmentBounds(slot, Math.max(t.beatIndex - 1, 0));
-    const segmentStartTime = t.nextStartTime - duration;
-    const intoSegment = Math.max(this.ctx.currentTime - segmentStartTime, 0);
-    return start + intoSegment;
+    const effectiveDuration = duration / rate;
+    const segmentStartTime = t.nextStartTime - effectiveDuration;
+    const intoSegmentWallClock = Math.max(this.ctx.currentTime - segmentStartTime, 0);
+    // Wall-clock elapsed time maps back to MORE buffer-time when rate > 1
+    // (playing faster) and LESS when rate < 1 — multiply, not divide.
+    return start + intoSegmentWallClock * rate;
   }
 
   getState() {
     return {
       a: { beatIndex: this.transports.a.beatIndex },
       b: { beatIndex: this.transports.b.beatIndex },
+      mix: {
+        a: { ...this.activeMix.a },
+        b: { ...this.activeMix.b },
+      },
       isRunning: Boolean(this._timer),
     };
   }

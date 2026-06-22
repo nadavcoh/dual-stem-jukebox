@@ -7,6 +7,11 @@ import { getPlaybackUrls } from "@/app/actions/presign";
 import TrackScrubber from "@/components/TrackScrubber";
 import JumpMatrix from "@/components/JumpMatrix";
 
+const DEFAULT_MIX = {
+  a: { vocal: true, instrumental: true },
+  b: { vocal: false, instrumental: false },
+};
+
 /**
  * @param {{
  *   trackA: { title: string, vocalsKey: string, instrumentalKey: string },
@@ -24,17 +29,22 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
 
   const [phase, setPhase] = useState("idle"); // idle | loading | playing
   const [error, setError] = useState(null);
-  const [mix, setMixState] = useState({
-    aVocal: true,
-    aInstrumental: true,
-    bVocal: false,
-    bInstrumental: false,
-  });
 
-  // Keep the screen from locking/dimming while actually playing — a
-  // 3-4 minute demucs-separated mashup session is exactly the kind of
-  // thing that shouldn't get cut off by your phone's screen timeout.
+  // Mirrors the engine's OWN mix state — the engine is the source of truth
+  // now, since auto-stem-switch changes it from inside the engine, not
+  // through React. Manual toggle clicks call engine.setMix() directly and
+  // let the next tick (or the immediate notify it triggers) reflect back.
+  const [mix, setMix] = useState(DEFAULT_MIX);
+  const [beatSync, setBeatSyncState] = useState(false);
+  const [autoJump, setAutoJumpState] = useState(false);
+  const [autoStemSwitch, setAutoStemSwitchState] = useState(false);
+
   useWakeLock(phase === "playing");
+
+  useEffect(() => {
+    const unsubscribe = engineRef.current.onTick((state) => setMix(state.mix));
+    return unsubscribe;
+  }, []);
 
   useEffect(() => () => engineRef.current.stop(), []);
 
@@ -45,9 +55,6 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
       const engine = engineRef.current;
       engine.ensureContext();
 
-      // The bucket is private — exchange object keys for short-lived
-      // presigned URLs right now, immediately before fetching, so they
-      // can't expire while the user was still deciding whether to hit play.
       const keys = [
         trackA.vocalsKey,
         trackA.instrumentalKey,
@@ -65,15 +72,26 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           vocalsUrl: urls[trackA.vocalsKey],
           instrumentalUrl: urls[trackA.instrumentalKey],
           beatTimes: jumpMap.beatTimesA,
+          bpm: jumpMap.bpmA,
         }),
         engine.loadTrack("b", {
           vocalsUrl: urls[trackB.vocalsKey],
           instrumentalUrl: urls[trackB.instrumentalKey],
           beatTimes: jumpMap.beatTimesB,
+          bpm: jumpMap.bpmB,
         }),
       ]);
 
-      engine.setActiveMix(mix);
+      engine.setJumpPoints(jumpMap.jumpPoints);
+      engine.setActiveMix({
+        aVocal: mix.a.vocal,
+        aInstrumental: mix.a.instrumental,
+        bVocal: mix.b.vocal,
+        bInstrumental: mix.b.instrumental,
+      });
+      engine.setBeatSync(beatSync);
+      engine.setAutoJump({ enabled: autoJump });
+      engine.setAutoStemSwitch({ enabled: autoStemSwitch });
       engine.start();
       setPhase("playing");
     } catch (err) {
@@ -81,7 +99,8 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
       setError(err?.message ?? "Couldn't load audio — check the stem keys and B2 credentials.");
       setPhase("idle");
     }
-  }, [trackA, trackB, jumpMap, mix]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackA, trackB, jumpMap]);
 
   const handleStop = useCallback(() => {
     engineRef.current.stop();
@@ -89,10 +108,10 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
   }, []);
 
   function toggleMix(slot, stem) {
-    const key = `${slot}${stem[0].toUpperCase()}${stem.slice(1)}`; // "aVocal", "bInstrumental", etc.
-    const next = { ...mix, [key]: !mix[key] };
-    setMixState(next);
-    if (phase === "playing") engineRef.current.setActiveMix(next);
+    const next = !mix[slot][stem];
+    engineRef.current.setMix(slot, stem, next ? 1 : 0);
+    // The engine's own notify (fired synchronously inside setMix) already
+    // updates `mix` via the onTick listener above — no need to set it here.
   }
 
   function handleApplyJump(jump) {
@@ -100,7 +119,26 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
     engineRef.current.applyJumpPoint(jump);
   }
 
+  function toggleBeatSync() {
+    const next = !beatSync;
+    setBeatSyncState(next);
+    if (phase === "playing") engineRef.current.setBeatSync(next);
+  }
+
+  function toggleAutoJump() {
+    const next = !autoJump;
+    setAutoJumpState(next);
+    if (phase === "playing") engineRef.current.setAutoJump({ enabled: next });
+  }
+
+  function toggleAutoStemSwitch() {
+    const next = !autoStemSwitch;
+    setAutoStemSwitchState(next);
+    if (phase === "playing") engineRef.current.setAutoStemSwitch({ enabled: next });
+  }
+
   const isPlaying = phase === "playing";
+  const pitchShiftB = isPlaying ? engineRef.current.getPitchShiftPercent("b") : 0;
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 rounded-xl border border-stone-800 bg-stone-950 p-5 text-stone-100">
@@ -134,6 +172,19 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         )}
       </header>
 
+      {/* Auto-behavior toggles */}
+      <div className="flex flex-wrap gap-2">
+        <ToggleChip label="Beat sync" active={beatSync} onClick={toggleBeatSync} />
+        <ToggleChip label="Auto jump" active={autoJump} onClick={toggleAutoJump} />
+        <ToggleChip label="Auto switch stems" active={autoStemSwitch} onClick={toggleAutoStemSwitch} />
+        {beatSync && isPlaying && (
+          <span className="self-center font-mono text-[10px] text-stone-500">
+            Deck B pitch {pitchShiftB >= 0 ? "+" : ""}
+            {pitchShiftB.toFixed(1)}%
+          </span>
+        )}
+      </div>
+
       {/* Two fully independent decks — each seekable to any beat at any
           time via its own scrubber, regardless of what the other is doing. */}
       <div className={`space-y-3 ${isPlaying ? "" : "pointer-events-none opacity-50"}`}>
@@ -145,7 +196,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           bpm={jumpMap.bpmA}
           beatTimes={jumpMap.beatTimesA}
           engineRef={engineRef}
-          mix={{ vocal: mix.aVocal, instrumental: mix.aInstrumental }}
+          mix={mix.a}
           onToggleMix={(stem) => toggleMix("a", stem)}
         />
         <TrackScrubber
@@ -156,7 +207,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           bpm={jumpMap.bpmB}
           beatTimes={jumpMap.beatTimesB}
           engineRef={engineRef}
-          mix={{ vocal: mix.bVocal, instrumental: mix.bInstrumental }}
+          mix={mix.b}
           onToggleMix={(stem) => toggleMix("b", stem)}
         />
       </div>
@@ -177,5 +228,20 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
       )}
       {error && <p className="text-center text-sm text-red-400">{error}</p>}
     </div>
+  );
+}
+
+function ToggleChip({ label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full border px-3 py-1 text-xs font-mono transition-colors ${
+        active
+          ? "border-emerald-400/60 bg-emerald-400/10 text-emerald-300"
+          : "border-stone-700 text-stone-500"
+      }`}
+    >
+      {label}
+    </button>
   );
 }
