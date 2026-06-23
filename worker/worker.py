@@ -109,6 +109,7 @@ def download_audio(youtube_id: str, dest_dir: Path) -> tuple[Path, str]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "remote_components": "ejs:github",  # Added to fix YouTube JS challenge blocks
     }
 
     url = f"https://www.youtube.com/watch?v={youtube_id}"
