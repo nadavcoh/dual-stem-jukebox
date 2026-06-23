@@ -132,38 +132,75 @@ export function downsampleMatrix(matrix, maxSize = 160) {
 }
 
 /**
+ * Maps diagonal-filter results computed against a *downsampled* heatmap
+ * back into approximate real beat indices, using the bin size recorded by
+ * downsampleMatrix(). Lands on the center beat of each bin — some
+ * precision loss is inherent (the heatmap was already downsampled for
+ * display), consistent with everywhere else this data is used.
+ */
+function binPointsToBeatIndices(points, beatTimesA, beatTimesB, binRows, binCols) {
+  return points.map((p) => {
+    const beatA = Math.min(p.beatA * binRows + Math.floor(binRows / 2), beatTimesA.length - 2);
+    const beatB = Math.min(p.beatB * binCols + Math.floor(binCols / 2), beatTimesB.length - 2);
+    return { beatA, beatB, score: p.score, timeA: beatTimesA[beatA], timeB: beatTimesB[beatB] };
+  });
+}
+
+/**
+ * Recomputes the jump-point list live, from the heatmap, at whatever
+ * threshold the user currently has tuned — this is what `findDiagonalJumpPoints`
+ * was always meant to be called with dynamically, rather than once at a
+ * fixed default. Cheap enough (heatmap is capped at 160x160) to call on
+ * every settings change.
+ *
+ * @param {{ data: number[][], binRows: number, binCols: number }} heatmap
+ * @param {number[]} beatTimesA
+ * @param {number[]} beatTimesB
+ * @param {{ peakThreshold?: number, neighborThreshold?: number, neighborRadius?: number, minNeighborHits?: number }} [tuning]
+ */
+export function recomputeJumpPointsFromHeatmap(heatmap, beatTimesA, beatTimesB, tuning = {}) {
+  const peakThreshold = tuning.peakThreshold ?? 0.9;
+  const raw = findDiagonalJumpPoints(heatmap.data, {
+    peakThreshold,
+    // Neighbor threshold trails the main slider by a fixed margin rather
+    // than being its own control — keeps the settings panel to one
+    // primary "how strict" knob instead of forcing the user to understand
+    // the diagonal-filter's internals to get a sane result.
+    neighborThreshold: tuning.neighborThreshold ?? Math.max(peakThreshold - 0.08, 0.5),
+    neighborRadius: tuning.neighborRadius ?? 2,
+    minNeighborHits: tuning.minNeighborHits ?? 3,
+    maxPoints: 300,
+  });
+  return binPointsToBeatIndices(raw, beatTimesA, beatTimesB, heatmap.binRows, heatmap.binCols);
+}
+
+/**
  * @param {object} matrixA parsed matrix.json for Track A
  * @param {object} matrixB parsed matrix.json for Track B
  * @param {{ maxHeatmapSize?: number }} [options]
  * @returns {{
- *   jumpPoints: Array,
  *   beatTimesA: number[], beatTimesB: number[],
  *   bpmA: number, bpmB: number,
  *   heatmap: { data: number[][], rows: number, cols: number, binRows: number, binCols: number },
  * }}
+ *
+ * No `jumpPoints` here anymore on purpose — they're now always derived
+ * client-side via recomputeJumpPointsFromHeatmap(), parameterized by
+ * whatever the user has tuned in the settings panel. Computing a fixed
+ * list here too would just be a second, inconsistent default that a
+ * "similarity threshold" slider couldn't actually move past.
  */
 export function buildCrossTrackJumpMap(matrixA, matrixB, { maxHeatmapSize = 160 } = {}) {
   const similarity = cosineSimilarityMatrix(
     matrixA.instrumental.features,
     matrixB.instrumental.features
   );
-  const rawPoints = findDiagonalJumpPoints(similarity);
 
   const beatTimesA = matrixA.instrumental.beat_times;
   const beatTimesB = matrixB.instrumental.beat_times;
-
-  const jumpPoints = rawPoints.map((p) => ({
-    beatA: p.beatA,
-    beatB: p.beatB,
-    score: p.score,
-    timeA: beatTimesA[p.beatA],
-    timeB: beatTimesB[p.beatB],
-  }));
-
   const heatmap = downsampleMatrix(similarity, maxHeatmapSize);
 
   return {
-    jumpPoints,
     beatTimesA,
     beatTimesB,
     bpmA: matrixA.bpm,

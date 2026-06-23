@@ -47,6 +47,22 @@ function formatTime(seconds) {
   return `${m}:${s}`;
 }
 
+/** Nearest jump-point marker to a (row, col) grid cell, within `tolerance` cells — for edit-mode hit-testing. */
+function findNearestMarker(jumpPoints, binRows, binCols, row, col, tolerance = 1.5) {
+  let best = null;
+  let bestDist = Infinity;
+  for (const p of jumpPoints) {
+    const pr = Math.floor(p.beatA / binRows);
+    const pc = Math.floor(p.beatB / binCols);
+    const dist = Math.hypot(pr - row, pc - col);
+    if (dist <= tolerance && dist < bestDist) {
+      bestDist = dist;
+      best = p;
+    }
+  }
+  return best;
+}
+
 const CANVAS_SIZE = 360; // logical px, square canvas — scaled to fit via CSS
 
 /**
@@ -56,20 +72,31 @@ const CANVAS_SIZE = 360; // logical px, square canvas — scaled to fit via CSS
  *   beatTimesA: number[], beatTimesB: number[],
  *   engineRef: { current: import("@/lib/audioEngine").JukeboxEngine | null },
  *   onApplyJump: (jump: {beatA: number, beatB: number}) => void,
+ *   onDeletePoint: (jump: {beatA: number, beatB: number}) => void,
  * }} props
  *
  * X axis = Track B beats, Y axis = Track A beats. Click anywhere to jump
  * both decks there directly — the green dots (precomputed jump points) are
- * a guide to where the algorithm found strong matches, not a restriction;
- * the whole point of this view is seeing the full continuous similarity
- * field so you can pick *any* point with your eyes open, including ones
- * the algorithm didn't flag.
+ * a guide to where the algorithm found strong matches, not a restriction.
+ * Toggle "Edit" to curate that guide instead: click a green dot to delete
+ * it from the candidate pool (auto-jump and the dot itself both respect
+ * that), inspired by the Infinite Jukebox's "click a branch, hit delete"
+ * tuning feature.
  */
-export default function JumpMatrix({ heatmap, jumpPoints, beatTimesA, beatTimesB, engineRef, onApplyJump }) {
+export default function JumpMatrix({
+  heatmap,
+  jumpPoints,
+  beatTimesA,
+  beatTimesB,
+  engineRef,
+  onApplyJump,
+  onDeletePoint,
+}) {
   const canvasRef = useRef(null);
   const offscreenRef = useRef(null);
   const rafRef = useRef(null);
   const [hover, setHover] = useState(null);
+  const [editMode, setEditMode] = useState(false);
 
   const { data, rows, cols, binRows, binCols } = heatmap;
 
@@ -159,16 +186,49 @@ export default function JumpMatrix({ heatmap, jumpPoints, beatTimesA, beatTimesB
     return { row, col, beatA, beatB, value: data[row]?.[col] ?? 0 };
   }
 
+  function handleClick(e) {
+    const cell = cellFromEvent(e);
+    if (editMode) {
+      const marker = findNearestMarker(jumpPoints, binRows, binCols, cell.row, cell.col);
+      if (marker) onDeletePoint(marker);
+      return;
+    }
+    onApplyJump(cell);
+  }
+
+  function handleMouseMove(e) {
+    setHover(cellFromEvent(e));
+  }
+
+  const hoveredMarker =
+    editMode && hover ? findNearestMarker(jumpPoints, binRows, binCols, hover.row, hover.col) : null;
+
   return (
     <div className="space-y-1.5">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10px] text-stone-500">Jump matrix</span>
+        <button
+          onClick={() => setEditMode((v) => !v)}
+          className={`rounded-full border px-2.5 py-0.5 text-[10px] font-mono transition-colors ${
+            editMode
+              ? "border-red-400/60 bg-red-400/10 text-red-300"
+              : "border-stone-700 text-stone-500"
+          }`}
+        >
+          {editMode ? "Editing — click a dot to remove it" : "Edit"}
+        </button>
+      </div>
+
       <canvas
         ref={canvasRef}
         width={CANVAS_SIZE}
         height={CANVAS_SIZE}
-        onClick={(e) => onApplyJump(cellFromEvent(e))}
-        onMouseMove={(e) => setHover(cellFromEvent(e))}
+        onClick={handleClick}
+        onMouseMove={handleMouseMove}
         onMouseLeave={() => setHover(null)}
-        className="w-full cursor-crosshair rounded-md border border-stone-800"
+        className={`w-full rounded-md border ${
+          editMode ? "cursor-pointer border-red-400/40" : "cursor-crosshair border-stone-800"
+        }`}
         style={{ aspectRatio: "1 / 1" }}
       />
 
@@ -183,9 +243,13 @@ export default function JumpMatrix({ heatmap, jumpPoints, beatTimesA, beatTimesB
       </div>
 
       <p className="h-4 text-center font-mono text-[11px] text-stone-400">
-        {hover
-          ? `A ${formatTime(beatTimesA[hover.beatA])} · B ${formatTime(beatTimesB[hover.beatB])} · similarity ${hover.value.toFixed(2)} — click to jump both decks here`
-          : `${jumpPoints.length} validated jump point${jumpPoints.length === 1 ? "" : "s"} marked in green`}
+        {editMode
+          ? hoveredMarker
+            ? `Point at A ${formatTime(beatTimesA[hoveredMarker.beatA])} · B ${formatTime(beatTimesB[hoveredMarker.beatB])} (score ${hoveredMarker.score.toFixed(2)}) — click to remove`
+            : "Hover a green dot, then click to remove it from the candidate pool"
+          : hover
+            ? `A ${formatTime(beatTimesA[hover.beatA])} · B ${formatTime(beatTimesB[hover.beatB])} · similarity ${hover.value.toFixed(2)} — click to jump both decks here`
+            : `${jumpPoints.length} jump point${jumpPoints.length === 1 ? "" : "s"} marked in green`}
       </p>
     </div>
   );

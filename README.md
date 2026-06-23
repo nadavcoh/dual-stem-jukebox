@@ -29,6 +29,7 @@ dual-stem-jukebox/
     │   ├── TrackSearch.jsx        # "Add Songs" tab — search + request processing
     │   ├── MashupLibrary.jsx      # "Build Mashup" tab — pick 2 completed tracks
     │   ├── JukeboxPlayer.jsx      # wires the two decks + matrix + wake lock together
+    │   ├── JukeboxSettings.jsx    # tuning panel — Infinite-Jukebox-inspired
     │   ├── TrackScrubber.jsx      # one deck's timeline — click anywhere to seek it
     │   └── JumpMatrix.jsx         # canvas heatmap of the full similarity matrix
     ├── hooks/
@@ -103,30 +104,48 @@ dual-stem-jukebox/
    `useAudioSync` paints each playhead via a CSS variable on every
    `requestAnimationFrame`, never touching React state; `useWakeLock`
    keeps the screen from locking mid-mashup.
-6. **Optional automatic behaviors** — three toggles, all off by default:
+6. **Optional automatic behaviors, fully tunable** — three toggles, all
+   off by default, with a **Tune** button opening a settings panel
+   directly inspired by the Infinite Jukebox's tuning dialog
+   ([musicmachinery.com](https://musicmachinery.com/2012/11/26/tuning-the-infinite-jukebox/)):
    - **Beat sync** — vari-speed beatmatching: Deck B's `playbackRate` is
      set to `bpmA / bpmB` so its beats land in time with Deck A's. This
      is the same technique a turntable's pitch fader uses, **not**
      pitch-corrected time-stretching — it shifts Deck B's pitch by
-     whatever the BPM ratio is. The UI shows the actual percentage so
-     it's never a mystery.
-   - **Auto jump** — every 16 of Deck A's beats, weighs whether to jump at
-     all and which candidate to take by `score²`: a near-perfect match
-     (0.98) gets taken almost every time it comes up; a borderline one
-     right at the 0.9 cutoff skips roughly 1 time in 6. Same
-     `applyJumpPoint()` a matrix click uses.
-   - **Auto switch stems** — has no timer of its own. It switches *only*
-     as a side effect of a jump (auto or manual click on the matrix) —
-     never independently — weighted 3:1 toward the two classic mashup
-     moves (one song's vocal over the other's beat) over the other five
-     curated combinations.
+     whatever the BPM ratio is. The UI shows the actual percentage live.
+   - **Auto jump** — borrows the Infinite Jukebox's probability model
+     directly: a "branch chance" starts low right after a jump and climbs
+     every checkpoint (every *N* of Deck A's beats) one isn't taken,
+     resetting to low the moment one is. *Which* candidate gets taken, on
+     top of that, is weighted by `score^exponent` — our own addition,
+     since we have a whole matrix of simultaneous candidates rather than
+     usually-one-per-beat. All of it tunable: similarity threshold,
+     probability range, ramp-up speed, checkpoint interval, weighting
+     sharpness.
+   - **Auto switch stems** — still coupled to jumps only, no independent
+     timer — now with a tunable weight for how much more likely the two
+     "classic" combos (one song's vocal over the other's beat) are versus
+     the other five.
 
-   Both auto-behaviors live in `applyJumpPoint()` / `_maybeAutoJump()` in
-   `lib/audioEngine.js`, counted off Deck A's own beat clock
-   (`_beatCounter`). The mix is engine-owned state for this reason: once
-   auto-switch can change it from inside the engine, React can't be the
-   source of truth for it anymore — `JukeboxPlayer` mirrors it via
-   `onTick()` instead of holding it locally.
+   The candidate pool itself is no longer fixed at build time either:
+   `recomputeJumpPointsFromHeatmap()` (`lib/crossTrackMatrix.js`) reruns
+   the diagonal-filter algorithm against the heatmap live, every time the
+   similarity threshold slider moves (debounced). Moving the slider
+   server-side-fixed-then-merely-narrowed candidates would've made the
+   threshold control cosmetic; this way it actually changes what's
+   available.
+
+   **Editing the matrix directly** — `JumpMatrix`'s "Edit" toggle turns
+   clicking a green dot into deleting it from the candidate pool (both
+   auto-jump's and the dot's own), the same "click a branch, hit delete"
+   idea from the Infinite Jukebox's tuning UI. "Restore N removed points"
+   in the settings panel undoes all of it at once — there's no
+   per-point undo, matching that same precedent.
+
+   The mix is engine-owned state for this reason: once auto-switch can
+   change it from inside the engine, React can't be the source of truth
+   for it anymore — `JukeboxPlayer` mirrors it via `onTick()` instead of
+   holding it locally.
 
 ## Setup
 

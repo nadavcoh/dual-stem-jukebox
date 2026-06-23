@@ -20,9 +20,11 @@
  *    vocoder, out of scope for a plain AudioBufferSourceNode); it shifts
  *    pitch slightly, proportional to the BPM ratio. Honest tradeoff, not
  *    a bug.
- *  - Auto Jump: every N beats, take a jump point — picked with probability
- *    weighted by score, both in *whether* a jump happens at all at that
- *    checkpoint and *which* candidate gets taken if so.
+ *  - Auto Jump: probability-ramping branch model borrowed directly from
+ *    the Infinite Jukebox (musicmachinery.com) — probability of jumping
+ *    starts low and climbs every checkpoint it doesn't, resetting to low
+ *    the moment one is taken. Which candidate gets taken, on top of that,
+ *    is weighted by score.
  *  - Auto Switch Stems: coupled to jumps, not its own timer — every time
  *    a jump happens (auto or manual), rotate to a different vocal/
  *    instrumental combination, weighted toward the two classic mashup
@@ -59,17 +61,18 @@ const STEMS = ["vocal", "instrumental"];
 
 // Curated combinations for auto-switch — deliberately not every possible
 // on/off permutation, so it never lands on dead silence and always picks
-// something that reads as an intentional mashup move. Weighted toward the
-// two "classic" combos (one song's vocal over the other's instrumental) —
-// that's the canonical mashup move; the rest are flavor, not the default.
+// something that reads as an intentional mashup move. The two "classic"
+// combos (one song's vocal over the other's instrumental) get a tunable
+// extra weight (autoStemSwitch.classicWeight) on top of the baseline 1
+// every other combo gets — see applyJumpPoint().
 const AUTO_SWITCH_COMBOS = [
-  { weight: 3, combo: { aVocal: true, aInstrumental: false, bVocal: false, bInstrumental: true } }, // classic: A's vocal over B's beat
-  { weight: 3, combo: { aVocal: false, aInstrumental: true, bVocal: true, bInstrumental: false } }, // the reverse
-  { weight: 1, combo: { aVocal: true, aInstrumental: true, bVocal: false, bInstrumental: false } }, // Track A solo
-  { weight: 1, combo: { aVocal: false, aInstrumental: false, bVocal: true, bInstrumental: true } }, // Track B solo
-  { weight: 1, combo: { aVocal: true, aInstrumental: true, bVocal: true, bInstrumental: true } }, // full collision
-  { weight: 1, combo: { aVocal: true, aInstrumental: false, bVocal: true, bInstrumental: false } }, // both vocals, no beat
-  { weight: 1, combo: { aVocal: false, aInstrumental: true, bVocal: false, bInstrumental: true } }, // both instrumentals
+  { isClassic: true, combo: { aVocal: true, aInstrumental: false, bVocal: false, bInstrumental: true } }, // classic: A's vocal over B's beat
+  { isClassic: true, combo: { aVocal: false, aInstrumental: true, bVocal: true, bInstrumental: false } }, // the reverse
+  { isClassic: false, combo: { aVocal: true, aInstrumental: true, bVocal: false, bInstrumental: false } }, // Track A solo
+  { isClassic: false, combo: { aVocal: false, aInstrumental: false, bVocal: true, bInstrumental: true } }, // Track B solo
+  { isClassic: false, combo: { aVocal: true, aInstrumental: true, bVocal: true, bInstrumental: true } }, // full collision
+  { isClassic: false, combo: { aVocal: true, aInstrumental: false, bVocal: true, bInstrumental: false } }, // both vocals, no beat
+  { isClassic: false, combo: { aVocal: false, aInstrumental: true, bVocal: false, bInstrumental: true } }, // both instrumentals
 ];
 
 /** Weighted random pick — `weightFn(item)` returns a non-negative weight. */
@@ -120,12 +123,34 @@ export class JukeboxEngine {
     this.beatSyncEnabled = false;
     this.rates = { a: 1, b: 1 };
 
-    // Jump points (from lib/crossTrackMatrix.js), used by auto-jump.
+    // Jump points (from lib/crossTrackMatrix.js — recomputed client-side
+    // whenever the similarity threshold setting changes), used by auto-jump.
     this.jumpPoints = [];
-    this.autoJump = { enabled: false, everyNBeats: 16, minScore: 0.9, scoreExponent: 2 };
+
+    // Auto-jump's probability model is borrowed directly from the
+    // Infinite Jukebox (musicmachinery.com/2012/11/26/tuning-the-infinite-jukebox):
+    // probability starts at probabilityLow, climbs toward probabilityHigh
+    // by rampUpSpeed% of the (high-low) range each checkpoint a jump ISN'T
+    // taken, and resets to probabilityLow the moment one IS taken. Which
+    // specific candidate gets taken, on top of that, is weighted by
+    // score^scoreExponent — the Infinite Jukebox doesn't need this part
+    // since it usually has at most one viable branch per beat; we have a
+    // whole matrix of candidates, so "which one" is its own decision.
+    this.autoJump = {
+      enabled: false,
+      everyNBeats: 16,
+      minScore: 0.9,
+      scoreExponent: 2,
+      probabilityLow: 0.05,
+      probabilityHigh: 0.6,
+      rampUpSpeed: 40, // 0-100, matching the blog's slider scale (100 -> 10%/checkpoint)
+    };
+    this._currentBranchProbability = this.autoJump.probabilityLow;
+    this._lastJumpScore = null;
+
     // No timer of its own — stems only ever switch as a side effect of a
     // jump (auto or manual), never independently. See applyJumpPoint().
-    this.autoStemSwitch = { enabled: false };
+    this.autoStemSwitch = { enabled: false, classicWeight: 3 };
     // Master clock for both auto-behaviors' cadence — counts Deck A's
     // forward-scheduled beats specifically (not affected by jumps/seeks),
     // so "every N beats" means elapsed real playback, not buffer position.
@@ -250,57 +275,56 @@ export class JukeboxEngine {
     this.jumpPoints = jumpPoints ?? [];
   }
 
-  setAutoJump({ enabled, everyNBeats, minScore, scoreExponent } = {}) {
-    this.autoJump = {
-      enabled: enabled ?? this.autoJump.enabled,
-      everyNBeats: everyNBeats ?? this.autoJump.everyNBeats,
-      minScore: minScore ?? this.autoJump.minScore,
-      scoreExponent: scoreExponent ?? this.autoJump.scoreExponent,
+  setAutoJump(partial = {}) {
+    this.autoJump = { ...this.autoJump, ...partial };
+    // Keep the live ramping value sane if the range itself just moved.
+    this._currentBranchProbability = Math.min(
+      Math.max(this._currentBranchProbability, this.autoJump.probabilityLow),
+      this.autoJump.probabilityHigh
+    );
+  }
+
+  setAutoStemSwitch(partial = {}) {
+    this.autoStemSwitch = { ...this.autoStemSwitch, ...partial };
+  }
+
+  /** For a live "branch chance" readout in the UI. */
+  getAutoJumpStatus() {
+    return {
+      currentProbabilityPercent: this._currentBranchProbability * 100,
+      lastJumpScore: this._lastJumpScore,
     };
   }
 
-  setAutoStemSwitch({ enabled } = {}) {
-    this.autoStemSwitch = { enabled: enabled ?? this.autoStemSwitch.enabled };
-  }
-
   /**
-   * Every `everyNBeats`, decides whether to jump at all, and if so, which
-   * candidate to take — both decisions weighted by score, not uniform.
-   *
-   * Candidates are filtered to score >= minScore, then each gets a weight
-   * of score^scoreExponent (default exponent 2, so the preference for
-   * strong matches over merely-adequate ones is more than linear). The
-   * best candidate's weight also sets the chance that *anything* happens
-   * at this checkpoint at all: a near-perfect match (0.98) skips this
-   * checkpoint only ~4% of the time; a borderline one right at minScore
-   * (say 0.91 with minScore 0.9) skips ~17% of the time. Concretely: the
-   * "skip" outcome gets weight (1 - bestWeight), competing in the same
-   * weighted draw as the real candidates.
+   * Every `everyNBeats`: if there's at least one candidate above
+   * `minScore`, roll against the current (ramping) probability. Take a
+   * score-weighted-random candidate and reset the probability to its low
+   * end on success; otherwise climb the probability toward its high end
+   * by `rampUpSpeed`% of the range, ready to try again next checkpoint.
    */
   _maybeAutoJump() {
-    const { enabled, everyNBeats, minScore, scoreExponent } = this.autoJump;
-    if (!enabled || this.jumpPoints.length === 0) return;
+    const { enabled, everyNBeats, minScore, scoreExponent, probabilityLow, probabilityHigh, rampUpSpeed } =
+      this.autoJump;
+    if (!enabled) return;
     if (this._beatCounter % everyNBeats !== 0) return;
 
     const candidates = this.jumpPoints.filter((p) => p.score >= minScore);
-    if (!candidates.length) return;
+    if (!candidates.length) return; // nothing available — don't ramp on an empty pool either
 
-    const weights = candidates.map((p) => p.score ** scoreExponent);
-    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
-    const bestWeight = Math.max(...weights);
-    const skipWeight = Math.max(1 - bestWeight, 0);
-
-    let roll = Math.random() * (totalWeight + skipWeight);
-    if (roll >= totalWeight) return; // skipped this checkpoint
-
-    for (let i = 0; i < candidates.length; i++) {
-      roll -= weights[i];
-      if (roll <= 0) {
-        this.applyJumpPoint(candidates[i]);
-        return;
-      }
+    if (Math.random() < this._currentBranchProbability) {
+      const picked = weightedPick(candidates, (p) => p.score ** scoreExponent);
+      this._lastJumpScore = picked.score;
+      this._currentBranchProbability = probabilityLow;
+      this.applyJumpPoint(picked);
+    } else {
+      // Per the blog: slider at 100 = +10 percentage points per checkpoint
+      // a jump wasn't taken; slider at 50 = +5; linear in between. Flat
+      // increment, not scaled by the probabilityLow..probabilityHigh
+      // range width.
+      const increment = (rampUpSpeed / 100) * 0.1;
+      this._currentBranchProbability = Math.min(this._currentBranchProbability + increment, probabilityHigh);
     }
-    this.applyJumpPoint(candidates[candidates.length - 1]); // floating-point edge case
   }
 
   // -------------------------------------------------------------------
@@ -317,6 +341,8 @@ export class JukeboxEngine {
     };
     this.slotSources = { a: [], b: [] };
     this._beatCounter = 0;
+    this._currentBranchProbability = this.autoJump.probabilityLow;
+    this._lastJumpScore = null;
     this._timer = setInterval(() => this._schedulerTick(), TICK_INTERVAL_MS);
   }
 
@@ -384,7 +410,8 @@ export class JukeboxEngine {
     this.seekTo("a", beatA);
     this.seekTo("b", beatB);
     if (this.autoStemSwitch.enabled) {
-      const { combo } = weightedPick(AUTO_SWITCH_COMBOS, (c) => c.weight);
+      const classicWeight = this.autoStemSwitch.classicWeight;
+      const { combo } = weightedPick(AUTO_SWITCH_COMBOS, (c) => (c.isClassic ? classicWeight : 1));
       this.setActiveMix(combo);
     }
   }
@@ -500,6 +527,7 @@ export class JukeboxEngine {
         a: { ...this.activeMix.a },
         b: { ...this.activeMix.b },
       },
+      autoJump: this.getAutoJumpStatus(),
       isRunning: Boolean(this._timer),
     };
   }
