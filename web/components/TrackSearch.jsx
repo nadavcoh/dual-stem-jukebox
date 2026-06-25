@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useTransition } from "react";
 import { searchYouTube } from "@/app/actions/search";
-import { requestProcessing, getLibrary } from "@/app/actions/library";
+import { requestProcessing, getLibrary, removeFromLibrary } from "@/app/actions/library";
 
 const STATUS_STYLES = {
   queued: "border-stone-600 text-stone-400",
@@ -23,30 +23,45 @@ function StatusBadge({ status }) {
   );
 }
 
-function ResultRow({ result, status, onRequest, isRequesting }) {
+function ResultRow({ result, libraryEntry, onRequest, onRemove, isRequesting, isRemoving }) {
   const minutes = Math.floor(result.durationSeconds / 60);
   const seconds = String(result.durationSeconds % 60).padStart(2, "0");
+  const status = libraryEntry?.status;
 
   return (
-    <li className="flex items-center gap-3 rounded-md p-2 hover:bg-white/5">
-      <img src={result.thumbnail} alt="" className="h-10 w-16 flex-shrink-0 rounded object-cover" />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm text-stone-100">{result.title}</p>
-        <p className="truncate text-xs text-stone-400">
-          {result.author} · {minutes}:{seconds}
-        </p>
+    <li className="space-y-1.5 rounded-md p-2 hover:bg-white/5">
+      <div className="flex items-start gap-2.5">
+        <img src={result.thumbnail} alt="" className="mt-0.5 h-9 w-9 flex-shrink-0 rounded object-cover" />
+        <div className="min-w-0 flex-1">
+          <p className="text-sm leading-snug text-stone-100">{result.title}</p>
+          <p className="truncate text-xs text-stone-400">
+            {result.author} · {minutes}:{seconds}
+          </p>
+        </div>
       </div>
-      {status && status !== "failed" ? (
-        <StatusBadge status={status} />
-      ) : (
-        <button
-          onClick={() => onRequest(result)}
-          disabled={isRequesting}
-          className="whitespace-nowrap rounded border border-cyan-400/40 px-2 py-1 text-xs font-mono text-cyan-300 hover:bg-cyan-400/10 disabled:opacity-40"
-        >
-          {isRequesting ? "Queuing…" : status === "failed" ? "Retry" : "Add to library"}
-        </button>
-      )}
+      <div className="flex items-center justify-end gap-1.5">
+        {status && status !== "failed" ? (
+          <>
+            <StatusBadge status={status} />
+            <button
+              onClick={() => onRemove(libraryEntry)}
+              disabled={isRemoving}
+              className="rounded border border-red-400/30 px-1.5 py-0.5 font-mono text-xs text-red-300/80 hover:bg-red-400/10 disabled:opacity-40"
+              title="Remove from queue/library"
+            >
+              ✕
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={() => onRequest(result)}
+            disabled={isRequesting}
+            className="whitespace-nowrap rounded border border-cyan-400/40 px-2 py-1 text-xs font-mono text-cyan-300 hover:bg-cyan-400/10 disabled:opacity-40"
+          >
+            {isRequesting ? "Queuing…" : status === "failed" ? "Retry" : "Add to library"}
+          </button>
+        )}
+      </div>
     </li>
   );
 }
@@ -55,8 +70,10 @@ export default function TrackSearch() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState([]);
   const [hiddenCount, setHiddenCount] = useState(0);
-  const [statusByYoutubeId, setStatusByYoutubeId] = useState({});
+  // youtube_id -> { id, status } — needs the row id now too, for removal.
+  const [libraryByYoutubeId, setLibraryByYoutubeId] = useState({});
   const [requestingId, setRequestingId] = useState(null);
+  const [removingId, setRemovingId] = useState(null);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [isSearching, startSearch] = useTransition();
@@ -72,7 +89,9 @@ export default function TrackSearch() {
     try {
       const res = await getLibrary();
       if (res.ok) {
-        setStatusByYoutubeId(Object.fromEntries(res.tracks.map((t) => [t.youtube_id, t.status])));
+        setLibraryByYoutubeId(
+          Object.fromEntries(res.tracks.map((t) => [t.youtube_id, { id: t.id, status: t.status }]))
+        );
       }
     } catch (err) {
       console.error("[TrackSearch] library refresh failed:", err);
@@ -111,17 +130,51 @@ export default function TrackSearch() {
         setError(res.error);
         return;
       }
-      setStatusByYoutubeId((prev) => ({ ...prev, [result.youtubeId]: res.status }));
+      setLibraryByYoutubeId((prev) => ({
+        ...prev,
+        [result.youtubeId]: { id: prev[result.youtubeId]?.id, status: res.status },
+      }));
       setNotice(
         res.alreadyExists
           ? `Already in the library (${res.status}).`
           : "Added to the queue — check the Build Mashup tab once it's completed."
       );
+      // The upsert above may have created a new row whose id we don't have
+      // yet (requestProcessing doesn't return it) — refresh to pick it up,
+      // so a remove button works immediately after adding.
+      refreshLibraryStatuses();
     } catch (err) {
       console.error("[TrackSearch] requestProcessing failed:", err);
       setError(err?.message ?? "Couldn't queue this track — try again in a moment.");
     } finally {
       setRequestingId(null);
+    }
+  }
+
+  async function handleRemove(entry) {
+    if (!entry?.id) return;
+    if (!window.confirm("Remove this track from the queue/library? This can't be undone.")) return;
+    setRemovingId(entry.id);
+    setError(null);
+    try {
+      const res = await removeFromLibrary(entry.id);
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setLibraryByYoutubeId((prev) => {
+        const next = { ...prev };
+        for (const [ytId, val] of Object.entries(next)) {
+          if (val.id === entry.id) delete next[ytId];
+        }
+        return next;
+      });
+      setNotice("Removed.");
+    } catch (err) {
+      console.error("[TrackSearch] removeFromLibrary failed:", err);
+      setError(err?.message ?? "Couldn't remove this track.");
+    } finally {
+      setRemovingId(null);
     }
   }
 
@@ -149,9 +202,11 @@ export default function TrackSearch() {
             <ResultRow
               key={r.youtubeId}
               result={r}
-              status={statusByYoutubeId[r.youtubeId]}
+              libraryEntry={libraryByYoutubeId[r.youtubeId]}
               isRequesting={requestingId === r.youtubeId}
+              isRemoving={removingId === libraryByYoutubeId[r.youtubeId]?.id}
               onRequest={handleRequest}
+              onRemove={handleRemove}
             />
           ))}
         </ul>

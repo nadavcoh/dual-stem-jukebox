@@ -49,7 +49,7 @@ export function findDiagonalJumpPoints(
     neighborThreshold = 0.82,
     neighborRadius = 2,
     minNeighborHits = 3,
-    maxPoints = 200,
+    maxPoints = 1500,
   } = {}
 ) {
   const n = similarity.length;
@@ -169,7 +169,6 @@ export function recomputeJumpPointsFromHeatmap(heatmap, beatTimesA, beatTimesB, 
     neighborThreshold: tuning.neighborThreshold ?? Math.max(peakThreshold - 0.08, 0.5),
     neighborRadius: tuning.neighborRadius ?? 2,
     minNeighborHits: tuning.minNeighborHits ?? 3,
-    maxPoints: 300,
   });
   return binPointsToBeatIndices(raw, beatTimesA, beatTimesB, heatmap.binRows, heatmap.binCols);
 }
@@ -181,6 +180,10 @@ export function recomputeJumpPointsFromHeatmap(heatmap, beatTimesA, beatTimesB, 
  * @returns {{
  *   beatTimesA: number[], beatTimesB: number[],
  *   bpmA: number, bpmB: number,
+ *   keyA: {pitch_class: number, is_major: boolean, name: string}|null,
+ *   keyB: {pitch_class: number, is_major: boolean, name: string}|null,
+ *   gainA: {vocal: number, instrumental: number},
+ *   gainB: {vocal: number, instrumental: number},
  *   heatmap: { data: number[][], rows: number, cols: number, binRows: number, binCols: number },
  * }}
  *
@@ -205,6 +208,10 @@ export function buildCrossTrackJumpMap(matrixA, matrixB, { maxHeatmapSize = 160 
     beatTimesB,
     bpmA: matrixA.bpm,
     bpmB: matrixB.bpm,
+    keyA: matrixA.key ?? null,
+    keyB: matrixB.key ?? null,
+    gainA: { vocal: matrixA.vocals_gain ?? 1, instrumental: matrixA.instrumental_gain ?? 1 },
+    gainB: { vocal: matrixB.vocals_gain ?? 1, instrumental: matrixB.instrumental_gain ?? 1 },
     heatmap,
   };
 }

@@ -9,7 +9,7 @@ them mid-song.
 dual-stem-jukebox/
 ├── supabase/
 │   └── migrations/              # tracks table, status enum, claim_next_track() RPC,
-│       └── ...                  # + the B2-private-bucket column rename
+│       └── ...                  # B2-private-bucket column rename, key detection columns
 ├── worker/                     # Python local worker (run on your own machine/GPU)
 │   ├── worker.py
 │   ├── requirements.txt
@@ -67,18 +67,21 @@ dual-stem-jukebox/
    multiple workers never grab the same job. It downloads the audio
    (`yt-dlp`), separates stems (`demucs`, 2-stem), and extracts
    beat-synchronous Chroma+MFCC features (`librosa`) for *each* stem,
-   storing them raw in `matrix.json`. It deliberately does **not** compute
-   a vocal-vs-instrumental similarity matrix for the track's own two stems
-   anymore — they're different timbral content by construction (harmonic
-   vocal formants vs. everything-but-vocals), so a high cosine-similarity
-   match between them was never musically meaningful; the matrix that
-   actually matters can only be built once you know *which two tracks*
-   you're mashing up (next step). Uploads the mp3 stems + `matrix.json` to
-   a **private** B2 bucket and marks the row `'completed'` with their
-   **object keys**, not public URLs. A video blocked in the worker's
-   region gets a clean one-line `GEO-BLOCKED` log instead of a traceback —
-   expected, not a bug, and the only fully authoritative check (the
-   pre-filter in step 1 is best-effort).
+   storing them raw in `matrix.json`. It also detects each track's musical
+   key (Krumhansl-Schmuckler key-finding against the instrumental's
+   aggregated chroma profile) and a per-stem loudness-normalization gain
+   (RMS-based) — both consumed by the player later. It deliberately does
+   **not** compute a vocal-vs-instrumental similarity matrix for the
+   track's own two stems anymore — they're different timbral content by
+   construction (harmonic vocal formants vs. everything-but-vocals), so a
+   high cosine-similarity match between them was never musically
+   meaningful; the matrix that actually matters can only be built once you
+   know *which two tracks* you're mashing up (next step). Uploads the mp3
+   stems + `matrix.json` to a **private** B2 bucket and marks the row
+   `'completed'` with their **object keys**, not public URLs. A video
+   blocked in the worker's region gets a clean one-line `GEO-BLOCKED` log
+   instead of a traceback — expected, not a bug, and the only fully
+   authoritative check (the pre-filter in step 1 is best-effort).
 4. **Build the real jump map** — when you open `/jukebox/[idA]/[idB]`, the
    Server Component exchanges each track's `matrix_json_key` for a
    presigned URL, fetches both `matrix.json` files, and calls
@@ -92,27 +95,40 @@ dual-stem-jukebox/
    downsampling instead of getting averaged away.
 5. **Play** — `JukeboxPlayer` resolves the four stem keys to presigned URLs
    just before decoding (so they can't expire while you were still
-   deciding whether to hit play), then hands them to `JukeboxEngine`
-   (`lib/audioEngine.js`) — two **completely independent** decks, each
-   running its own lookahead scheduler from the moment you hit Load & Play
-   until you stop. Each `TrackScrubber` is a click-anywhere-to-seek
-   timeline for its own deck only; `JumpMatrix` renders the actual
-   similarity field as a heatmap with the algorithm's validated jump
-   points marked in green and a live two-color crosshair showing both
-   decks' real-time position in that 2D space — click anywhere on it
-   (not just the green dots) to send both decks there at once.
-   `useAudioSync` paints each playhead via a CSS variable on every
+   deciding whether to hit play), tracking download progress per stem via
+   `ReadableStream` chunks (`_fetchWithProgress` in `lib/audioEngine.js` —
+   `decodeAudioData` itself has no progress API, so the bar reflects the
+   download, which is most of the real wait for typical file sizes), then
+   hands the decoded buffers to `JukeboxEngine` — two **completely
+   independent** decks, each running its own lookahead scheduler from the
+   moment you hit Load & Play until you stop. `pause()`/`resume()` use
+   `AudioContext.suspend()`/`resume()` directly — the whole audio clock
+   freezes in place, so every scheduled event just waits with no manual
+   bookkeeping; `rewind()` seeks both decks back to beat 0 without the
+   stem-switch side effect a real jump has. Each `TrackScrubber` is a
+   click-anywhere-to-seek timeline for its own deck only; `JumpMatrix`
+   renders the actual similarity field as a heatmap with the algorithm's
+   validated jump points marked in green and a live two-color crosshair
+   showing both decks' real-time position in that 2D space — click
+   anywhere on it (not just the green dots) to send both decks there at
+   once. `useAudioSync` paints each playhead via a CSS variable on every
    `requestAnimationFrame`, never touching React state; `useWakeLock`
    keeps the screen from locking mid-mashup.
-6. **Optional automatic behaviors, fully tunable** — three toggles, all
-   off by default, with a **Tune** button opening a settings panel
-   directly inspired by the Infinite Jukebox's tuning dialog
+6. **Optional automatic behaviors, fully tunable, on by default** — a
+   **Tune** button opens a settings panel directly inspired by the
+   Infinite Jukebox's tuning dialog
    ([musicmachinery.com](https://musicmachinery.com/2012/11/26/tuning-the-infinite-jukebox/)):
    - **Beat sync** — vari-speed beatmatching: Deck B's `playbackRate` is
      set to `bpmA / bpmB` so its beats land in time with Deck A's. This
      is the same technique a turntable's pitch fader uses, **not**
      pitch-corrected time-stretching — it shifts Deck B's pitch by
-     whatever the BPM ratio is. The UI shows the actual percentage live.
+     whatever the BPM ratio is.
+   - **Key match** — same mechanism, different basis: shifts Deck B's
+     pitch toward Deck A's detected key instead of its tempo. Combined
+     multiplicatively with Beat Sync when both are on — they're generally
+     *different* ratios, so running both is a compromise toward each, not
+     a perfect solve for either. The UI shows both contributions
+     separately (`getRateBreakdown()`) so that's never hidden.
    - **Auto jump** — borrows the Infinite Jukebox's probability model
      directly: a "branch chance" starts low right after a jump and climbs
      every checkpoint (every *N* of Deck A's beats) one isn't taken,
@@ -127,13 +143,24 @@ dual-stem-jukebox/
      "classic" combos (one song's vocal over the other's beat) are versus
      the other five.
 
+   All four default to **on** — these are the headline features, not
+   opt-ins to discover later.
+
    The candidate pool itself is no longer fixed at build time either:
    `recomputeJumpPointsFromHeatmap()` (`lib/crossTrackMatrix.js`) reruns
    the diagonal-filter algorithm against the heatmap live, every time the
    similarity threshold slider moves (debounced). Moving the slider
    server-side-fixed-then-merely-narrowed candidates would've made the
    threshold control cosmetic; this way it actually changes what's
-   available.
+   available. The cap on returned points went from 200/300 up to 1500 —
+   at a 160×160 heatmap the dedup logic already keeps the real count far
+   below any cap that mattered, and a finer threshold step (0.001, most
+   useful between 0.95-0.99) can legitimately surface far more candidates
+   in a dense region than the old cap allowed through. The threshold
+   slider's settings (and every other tuning value) can be saved as your
+   new default via the settings panel — stored in `localStorage`, loaded
+   automatically next time, with "Reset" falling back to that saved value
+   (or the factory default if you've never saved one).
 
    **Editing the matrix directly** — `JumpMatrix`'s "Edit" toggle turns
    clicking a green dot into deleting it from the candidate pool (both
@@ -146,6 +173,22 @@ dual-stem-jukebox/
    change it from inside the engine, React can't be the source of truth
    for it anymore — `JukeboxPlayer` mirrors it via `onTick()` instead of
    holding it locally.
+7. **Loudness normalization, always on** — each stem's persistent gain
+   node carries the worker's RMS-based normalization gain
+   (`compute_normalization_gain()`), clamped to 0.3-3x so a near-silent
+   separated stem doesn't get boosted into amplifying noise. "On" in the
+   mix never means literal `1.0` — it means "this stem's normalized
+   level." No toggle for this one; there's no real reason you'd want the
+   two tracks at mismatched volumes.
+8. **Library management** — `MashupLibrary` has its own search box now
+   (client-side filter over the completed list), and every row — queued,
+   processing, completed, or failed — has a ✕ button calling
+   `removeFromLibrary()`. That only deletes the Supabase row, deliberately
+   never B2: the web app only ever holds B2's *read-only* key, so it
+   couldn't delete the uploaded stems even if it wanted to. A removed
+   completed track's files become orphaned in the bucket — harmless, just
+   not automatically cleaned up; that's a job for a worker-side sweep
+   script if it ever bothers you, not this app.
 
 ## Setup
 
@@ -186,6 +229,17 @@ python worker.py
 Requires `ffmpeg` on PATH (used by both `yt-dlp` and `demucs`). `demucs`
 will use a GPU automatically via PyTorch if one's available — on CPU,
 separating a 3-4 minute song typically takes a couple of minutes.
+
+YouTube's signature challenges increasingly need actual JavaScript
+execution to solve — `worker.py` enables yt-dlp's External JS (EJS)
+system (`remote_components: {"ejs:github"}`) to fetch the solver scripts
+from yt-dlp's own GitHub org on demand. You'll also need a JS runtime
+installed for EJS to run them — [Deno](https://deno.com) is the default
+and recommended (it runs the fetched JS sandboxed, no filesystem/network
+access); Node, Bun, and QuickJS are also supported. See
+[yt-dlp's EJS wiki page](https://github.com/yt-dlp/yt-dlp/wiki/EJS) for
+details — this is a real, deliberately-narrow opt-in yt-dlp shipped for
+exactly this problem, not a workaround.
 
 ### 4. Web app
 
@@ -232,11 +286,14 @@ npm run dev
 - **Respect YouTube's Terms of Service and copyright law** for whatever you
   download and remix — this stack is built for personal experimentation /
   DJ-style mashups, not redistribution of others' recordings.
-- The worker's per-track `matrix.json` includes a vocal↔instrumental jump
-  map for that single track (exactly what the spec's step 4–5 describe) —
-  the cross-*track* A↔B map the player needs is a small additional step
-  (`buildCrossTrackJumpMap`) done once both tracks exist, since it's only
-  meaningful once you know which two songs you're mashing up.
+- **Beat Sync and Key Match both work by changing `playbackRate` — neither
+  is pitch-corrected.** They're the same lever (vari-speed), pointed at two
+  different targets (tempo ratio vs. semitone ratio). Run only one and it
+  does exactly what it says; run both and the result is `tempoRate *
+  pitchRate` — a compromise toward each, not a perfect solve for either,
+  since they're generally different ratios. True independent pitch
+  correction needs a phase vocoder or similar, which is a real DSP
+  undertaking deliberately out of scope here.
 - `demucs --two-stems vocals` is what actually gives you a clean 2-stem
   split (`vocals.mp3` / `no_vocals.mp3`) on top of the `htdemucs` model —
   there's no separate "htdemucs_2stems" model, it's this flag combination.

@@ -16,10 +16,14 @@
  *
  *  - Beat Sync: vari-speed beatmatching via playbackRate, locking Deck B's
  *    tempo to Deck A's — the same technique a turntable pitch fader uses.
- *    This is NOT pitch-corrected time-stretching (that needs a phase
- *    vocoder, out of scope for a plain AudioBufferSourceNode); it shifts
- *    pitch slightly, proportional to the BPM ratio. Honest tradeoff, not
- *    a bug.
+ *  - Key Match: ALSO via playbackRate, shifting Deck B's pitch toward
+ *    Deck A's detected key. Combined multiplicatively with Beat Sync's
+ *    rate when both are on — they're generally different ratios, so
+ *    running both is a compromise toward each, not a perfect solve for
+ *    either. Neither of these is pitch-corrected time-stretching (that
+ *    needs a phase vocoder, out of scope for a plain
+ *    AudioBufferSourceNode); both shift pitch as a side effect of
+ *    changing speed. Honest tradeoff, not a bug.
  *  - Auto Jump: probability-ramping branch model borrowed directly from
  *    the Infinite Jukebox (musicmachinery.com) — probability of jumping
  *    starts low and climbs every checkpoint it doesn't, resetting to low
@@ -29,6 +33,15 @@
  *    a jump happens (auto or manual), rotate to a different vocal/
  *    instrumental combination, weighted toward the two classic mashup
  *    moves (one song's vocal over the other's beat).
+ *
+ * Each stem also carries a normalization gain (RMS-based, computed by the
+ * worker) baked into the persistent gain nodes below — so "on" doesn't
+ * mean literal 1.0, it means "this stem's normalized level."
+ *
+ * pause()/resume() use AudioContext.suspend()/resume() directly — the
+ * whole audio clock freezes in place, so every scheduled event (in-flight
+ * or queued ahead) just waits without any manual bookkeeping needed. This
+ * is simpler than it sounds specifically because of that API.
  *
  * Routing graph (persistent for the life of the engine):
  *
@@ -98,6 +111,15 @@ export class JukeboxEngine {
     this.beatTimes = { a: [], b: [] };
     // { a: number, b: number } BPM, used for Beat Sync's rate calculation
     this.bpm = { a: null, b: null };
+    // { a: number|null, b: number|null } detected key, pitch class 0-11
+    // (0=C), used by Key Match's rate calculation. Major/minor doesn't
+    // affect the shift itself (just pitch-class alignment), only the
+    // displayed key names.
+    this.keySemitone = { a: null, b: null };
+    // Per-stem loudness-normalization multiplier from the worker (RMS-based).
+    // Baked into the persistent gain nodes — "on" means "this stem's
+    // normalized level," not literally 1.0.
+    this.normGain = { a: { vocal: 1, instrumental: 1 }, b: { vocal: 1, instrumental: 1 } };
 
     // Persistent routing graph gain nodes: this.gainNodes.a.vocal, etc.
     this.gainNodes = { a: {}, b: {} };
@@ -121,6 +143,10 @@ export class JukeboxEngine {
     // reference (rate 1); Deck B's rate is recomputed from the BPM ratio
     // whenever sync is toggled on or new tracks are loaded.
     this.beatSyncEnabled = false;
+    // Key Match: same mechanism (playbackRate), different basis (detected
+    // key instead of BPM). Combined multiplicatively with Beat Sync in
+    // _recomputeRates() — see that method's comment for the tradeoff.
+    this.keyMatchEnabled = false;
     this.rates = { a: 1, b: 1 };
 
     // Jump points (from lib/crossTrackMatrix.js — recomputed client-side
@@ -175,7 +201,7 @@ export class JukeboxEngine {
       for (const slot of SLOTS) {
         for (const stem of STEMS) {
           const gain = this.ctx.createGain();
-          gain.gain.value = this.activeMix[slot][stem] ? 1 : 0;
+          gain.gain.value = this.activeMix[slot][stem] ? this.normGain[slot][stem] : 0;
           gain.connect(this.masterGain);
           this.gainNodes[slot][stem] = gain;
         }
@@ -185,25 +211,79 @@ export class JukeboxEngine {
     return this.ctx;
   }
 
-  async _decode(url) {
-    const res = await fetch(url);
-    const arrayBuffer = await res.arrayBuffer();
+  async _decode(url, onProgress) {
+    const arrayBuffer = await this._fetchWithProgress(url, onProgress);
     return this.ctx.decodeAudioData(arrayBuffer);
   }
 
   /**
-   * @param {"a"|"b"} slot
-   * @param {{vocalsUrl: string, instrumentalUrl: string, beatTimes: number[], bpm?: number}} data
+   * Fetches with progress (0..1) reported via onProgress, when the server
+   * sends a Content-Length header — falls back to a single jump from 0 to
+   * 1 if it doesn't (some presigned-URL responses omit it). Only covers
+   * the download itself; decodeAudioData has no progress API of its own,
+   * so the bar reaches ~100% slightly before the promise actually resolves.
+   * For typical compressed-audio file sizes that decode step is fast
+   * (well under a second to a couple seconds), so this is most of the
+   * real wait time, not a cosmetic approximation of it.
    */
-  async loadTrack(slot, { vocalsUrl, instrumentalUrl, beatTimes, bpm }) {
+  async _fetchWithProgress(url, onProgress) {
+    const res = await fetch(url);
+    const total = Number(res.headers.get("content-length")) || 0;
+
+    if (!res.body || !total || !onProgress) {
+      const buf = await res.arrayBuffer();
+      onProgress?.(1);
+      return buf;
+    }
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+      onProgress(Math.min(loaded / total, 1));
+    }
+
+    const merged = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return merged.buffer;
+  }
+
+  /**
+   * @param {"a"|"b"} slot
+   * @param {{
+   *   vocalsUrl: string, instrumentalUrl: string, beatTimes: number[],
+   *   bpm?: number, keySemitone?: number,
+   *   vocalsGain?: number, instrumentalGain?: number,
+   *   onProgress?: (fraction: number) => void,
+   * }} data
+   */
+  async loadTrack(
+    slot,
+    { vocalsUrl, instrumentalUrl, beatTimes, bpm, keySemitone, vocalsGain, instrumentalGain, onProgress }
+  ) {
     this.ensureContext();
+    const progress = { vocal: 0, instrumental: 0 };
+    const report = (stem) => (fraction) => {
+      progress[stem] = fraction;
+      onProgress?.((progress.vocal + progress.instrumental) / 2);
+    };
     const [vocal, instrumental] = await Promise.all([
-      this._decode(vocalsUrl),
-      this._decode(instrumentalUrl),
+      this._decode(vocalsUrl, report("vocal")),
+      this._decode(instrumentalUrl, report("instrumental")),
     ]);
     this.buffers[slot] = { vocal, instrumental };
     this.beatTimes[slot] = beatTimes;
     this.bpm[slot] = bpm ?? null;
+    this.keySemitone[slot] = keySemitone ?? null;
+    this.normGain[slot] = { vocal: vocalsGain ?? 1, instrumental: instrumentalGain ?? 1 };
     this._recomputeRates();
   }
 
@@ -211,14 +291,15 @@ export class JukeboxEngine {
   // Mix controls (persistent routing graph — separate from transport position)
   // -------------------------------------------------------------------
 
-  /** @param {"a"|"b"} slot @param {"vocal"|"instrumental"} stem @param {number} level 0..1 */
+  /** @param {"a"|"b"} slot @param {"vocal"|"instrumental"} stem @param {number} level 0..1 — 0 is always off, any positive value means "on" (scaled by this stem's normalization gain) */
   setMix(slot, stem, level, rampSeconds = 0.05) {
     const gain = this.gainNodes[slot]?.[stem];
     if (!gain) return;
+    const target = level > 0 ? this.normGain[slot][stem] * level : 0;
     const now = this.ctx.currentTime;
     gain.gain.cancelScheduledValues(now);
     gain.gain.setValueAtTime(gain.gain.value, now);
-    gain.gain.linearRampToValueAtTime(level, now + rampSeconds);
+    gain.gain.linearRampToValueAtTime(target, now + rampSeconds);
     this.activeMix[slot][stem] = level > 0;
     this._notify();
   }
@@ -237,14 +318,16 @@ export class JukeboxEngine {
       const now = this.ctx.currentTime;
       gain.gain.cancelScheduledValues(now);
       gain.gain.setValueAtTime(gain.gain.value, now);
-      gain.gain.linearRampToValueAtTime(on ? 1 : 0, now + 0.05);
+      gain.gain.linearRampToValueAtTime(on ? this.normGain[slot][stem] : 0, now + 0.05);
       this.activeMix[slot][stem] = Boolean(on);
     }
     this._notify();
   }
 
   // -------------------------------------------------------------------
-  // Beat Sync (vari-speed beatmatching — shifts pitch, not pitch-corrected)
+  // Beat Sync + Key Match (both vari-speed via playbackRate — see the
+  // class doc comment for why combining them is a compromise, not a
+  // perfect solve for both)
   // -------------------------------------------------------------------
 
   setBeatSync(enabled) {
@@ -253,17 +336,45 @@ export class JukeboxEngine {
     this._notify();
   }
 
-  _recomputeRates() {
-    if (this.beatSyncEnabled && this.bpm.a && this.bpm.b) {
-      this.rates = { a: 1, b: this.bpm.a / this.bpm.b };
-    } else {
-      this.rates = { a: 1, b: 1 };
-    }
+  setKeyMatch(enabled) {
+    this.keyMatchEnabled = enabled;
+    this._recomputeRates();
+    this._notify();
   }
 
-  /** Deck B's current pitch shift from Beat Sync, as a +/- percentage, for display. */
+  _recomputeRates() {
+    const tempoRate =
+      this.beatSyncEnabled && this.bpm.a && this.bpm.b ? this.bpm.a / this.bpm.b : 1;
+
+    let pitchRate = 1;
+    if (this.keyMatchEnabled && this.keySemitone.a != null && this.keySemitone.b != null) {
+      let semitoneDiff = this.keySemitone.a - this.keySemitone.b;
+      // Shortest rotation: e.g. +7 and -5 reach the same pitch class an
+      // octave apart — prefer whichever needs the smaller absolute shift.
+      if (semitoneDiff > 6) semitoneDiff -= 12;
+      if (semitoneDiff < -6) semitoneDiff += 12;
+      pitchRate = 2 ** (semitoneDiff / 12);
+    }
+
+    this.rates = { a: 1, b: tempoRate * pitchRate };
+  }
+
+  /** Deck B's current TOTAL pitch shift (tempo + key combined), as a +/- percentage. */
   getPitchShiftPercent(slot) {
     return (this.rates[slot] - 1) * 100;
+  }
+
+  /** Breaks the combined rate back into its two contributing factors, for an honest UI readout when both are on at once. */
+  getRateBreakdown(slot) {
+    const tempoRate =
+      slot === "b" && this.beatSyncEnabled && this.bpm.a && this.bpm.b ? this.bpm.a / this.bpm.b : 1;
+    const combined = this.rates[slot] ?? 1;
+    const pitchRate = tempoRate !== 0 ? combined / tempoRate : 1;
+    return {
+      tempoPercent: (tempoRate - 1) * 100,
+      pitchPercent: (pitchRate - 1) * 100,
+      combinedPercent: (combined - 1) * 100,
+    };
   }
 
   // -------------------------------------------------------------------
@@ -359,6 +470,28 @@ export class JukeboxEngine {
       }
     }
     this.slotSources = { a: [], b: [] };
+  }
+
+  /**
+   * Suspends the AudioContext itself — every scheduled event, in-flight or
+   * queued ahead, just freezes in place along with the audio clock. No
+   * manual bookkeeping needed: the scheduler's setInterval keeps firing in
+   * real wall-clock time, but its while-loop condition compares against
+   * ctx.currentTime, which has stopped advancing, so it harmlessly no-ops
+   * until resume().
+   */
+  async pause() {
+    if (this.ctx && this.ctx.state === "running") await this.ctx.suspend();
+  }
+
+  async resume() {
+    if (this.ctx && this.ctx.state === "suspended") await this.ctx.resume();
+  }
+
+  /** Restarts both decks from beat 0 — a plain reposition, not a "jump" (no auto-stem-switch side effect). */
+  rewind() {
+    this.seekTo("a", 0);
+    this.seekTo("b", 0);
   }
 
   /**

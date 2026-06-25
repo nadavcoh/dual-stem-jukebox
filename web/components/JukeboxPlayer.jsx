@@ -26,6 +26,23 @@ const DEFAULT_SETTINGS = {
   classicComboWeight: 3, // auto-switch-stems bias toward the classic combos
 };
 
+const TUNE_STORAGE_KEY = "dual-stem-jukebox:tuneDefaults";
+
+function loadSavedDefaults() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(TUNE_STORAGE_KEY);
+    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : null;
+  } catch {
+    return null;
+  }
+}
+
+function keyName(key) {
+  if (!key) return null;
+  return key.name ?? null;
+}
+
 /**
  * @param {{
  *   trackA: { title: string, vocalsKey: string, instrumentalKey: string },
@@ -33,6 +50,8 @@ const DEFAULT_SETTINGS = {
  *   jumpMap: {
  *     beatTimesA: number[], beatTimesB: number[],
  *     bpmA: number, bpmB: number,
+ *     keyA: object|null, keyB: object|null,
+ *     gainA: {vocal: number, instrumental: number}, gainB: {vocal: number, instrumental: number},
  *     heatmap: { data: number[][], rows: number, cols: number, binRows: number, binCols: number },
  *   },
  * }} props
@@ -41,26 +60,31 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
   const engineRef = useRef(null);
   if (!engineRef.current) engineRef.current = new JukeboxEngine();
 
-  const [phase, setPhase] = useState("idle"); // idle | loading | playing
+  const [phase, setPhase] = useState("idle"); // idle | loading | playing | paused
   const [error, setError] = useState(null);
+  const [loadProgress, setLoadProgress] = useState({ a: 0, b: 0 });
 
   // Engine-mirrored state (the engine is the source of truth — see
   // lib/audioEngine.js's class doc comment for why).
   const [mix, setMix] = useState(DEFAULT_MIX);
   const [autoJumpStatus, setAutoJumpStatus] = useState({ currentProbabilityPercent: 5, lastJumpScore: null });
 
-  const [beatSync, setBeatSyncState] = useState(false);
-  const [autoJump, setAutoJumpState] = useState(false);
-  const [autoStemSwitch, setAutoStemSwitchState] = useState(false);
+  // On by default — these are the headline features, not opt-ins someone
+  // has to discover. Beat sync / key match only audibly do anything once
+  // both decks are loaded (no BPM/key to compare against before that).
+  const [beatSync, setBeatSyncState] = useState(true);
+  const [keyMatch, setKeyMatchState] = useState(true);
+  const [autoJump, setAutoJumpState] = useState(true);
+  const [autoStemSwitch, setAutoStemSwitchState] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState(() => loadSavedDefaults() ?? DEFAULT_SETTINGS);
 
   // The jump-point list is now always *derived* from the heatmap at
   // whatever threshold is currently tuned, not a fixed value computed
   // once server-side — see lib/crossTrackMatrix.js's recomputeJumpPointsFromHeatmap.
   const [rawJumpPoints, setRawJumpPoints] = useState(() =>
     recomputeJumpPointsFromHeatmap(jumpMap.heatmap, jumpMap.beatTimesA, jumpMap.beatTimesB, {
-      peakThreshold: DEFAULT_SETTINGS.minScore,
+      peakThreshold: settings.minScore,
     })
   );
   // User-curated removals (the matrix's "Edit" mode) — keyed by "beatA:beatB".
@@ -123,6 +147,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
     setError(null);
     try {
       setPhase("loading");
+      setLoadProgress({ a: 0, b: 0 });
       const engine = engineRef.current;
       engine.ensureContext();
 
@@ -144,12 +169,20 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           instrumentalUrl: urls[trackA.instrumentalKey],
           beatTimes: jumpMap.beatTimesA,
           bpm: jumpMap.bpmA,
+          keySemitone: jumpMap.keyA?.pitch_class ?? null,
+          vocalsGain: jumpMap.gainA?.vocal,
+          instrumentalGain: jumpMap.gainA?.instrumental,
+          onProgress: (p) => setLoadProgress((prev) => ({ ...prev, a: p })),
         }),
         engine.loadTrack("b", {
           vocalsUrl: urls[trackB.vocalsKey],
           instrumentalUrl: urls[trackB.instrumentalKey],
           beatTimes: jumpMap.beatTimesB,
           bpm: jumpMap.bpmB,
+          keySemitone: jumpMap.keyB?.pitch_class ?? null,
+          vocalsGain: jumpMap.gainB?.vocal,
+          instrumentalGain: jumpMap.gainB?.instrumental,
+          onProgress: (p) => setLoadProgress((prev) => ({ ...prev, b: p })),
         }),
       ]);
 
@@ -160,6 +193,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         bInstrumental: mix.b.instrumental,
       });
       engine.setBeatSync(beatSync);
+      engine.setKeyMatch(keyMatch);
       engine.setAutoJump({ enabled: autoJump });
       engine.setAutoStemSwitch({ enabled: autoStemSwitch });
       engine.start();
@@ -176,6 +210,21 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
     engineRef.current.stop();
     setPhase("idle");
   }, []);
+
+  const handlePauseToggle = useCallback(async () => {
+    if (phase === "playing") {
+      await engineRef.current.pause();
+      setPhase("paused");
+    } else if (phase === "paused") {
+      await engineRef.current.resume();
+      setPhase("playing");
+    }
+  }, [phase]);
+
+  const handleRewind = useCallback(() => {
+    if (phase !== "playing" && phase !== "paused") return;
+    engineRef.current.rewind();
+  }, [phase]);
 
   function toggleMix(slot, stem) {
     const next = !mix[slot][stem];
@@ -194,23 +243,45 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
   function toggleBeatSync() {
     const next = !beatSync;
     setBeatSyncState(next);
-    if (phase === "playing") engineRef.current.setBeatSync(next);
+    if (phase !== "idle") engineRef.current.setBeatSync(next);
+  }
+
+  function toggleKeyMatch() {
+    const next = !keyMatch;
+    setKeyMatchState(next);
+    if (phase !== "idle") engineRef.current.setKeyMatch(next);
   }
 
   function toggleAutoJump() {
     const next = !autoJump;
     setAutoJumpState(next);
-    if (phase === "playing") engineRef.current.setAutoJump({ enabled: next });
+    if (phase !== "idle") engineRef.current.setAutoJump({ enabled: next });
   }
 
   function toggleAutoStemSwitch() {
     const next = !autoStemSwitch;
     setAutoStemSwitchState(next);
-    if (phase === "playing") engineRef.current.setAutoStemSwitch({ enabled: next });
+    if (phase !== "idle") engineRef.current.setAutoStemSwitch({ enabled: next });
+  }
+
+  function handleSaveSettingsAsDefault() {
+    try {
+      window.localStorage.setItem(TUNE_STORAGE_KEY, JSON.stringify(settings));
+    } catch (err) {
+      console.error("[JukeboxPlayer] couldn't save tune defaults:", err);
+    }
+  }
+
+  function handleResetSettings() {
+    setSettings(loadSavedDefaults() ?? DEFAULT_SETTINGS);
   }
 
   const isPlaying = phase === "playing";
-  const pitchShiftB = isPlaying ? engineRef.current.getPitchShiftPercent("b") : 0;
+  const isPaused = phase === "paused";
+  const isActive = isPlaying || isPaused;
+  const isLoading = phase === "loading";
+  const overallProgress = Math.round(((loadProgress.a + loadProgress.b) / 2) * 100);
+  const rateB = isActive ? engineRef.current.getRateBreakdown("b") : null;
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-4 rounded-xl border border-stone-800 bg-stone-950 p-5 text-stone-100">
@@ -233,7 +304,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           >
             Tune
           </button>
-          {isPlaying ? (
+          {isActive ? (
             <button
               onClick={handleStop}
               className="rounded-md bg-stone-100 px-4 py-2 text-sm font-medium text-stone-900"
@@ -243,27 +314,55 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           ) : (
             <button
               onClick={handleLoadAndPlay}
-              disabled={phase === "loading"}
+              disabled={isLoading}
               className="rounded-md bg-gradient-to-r from-cyan-500 to-orange-500 px-4 py-2 text-sm font-semibold text-stone-950 disabled:opacity-50"
             >
-              {phase === "loading" ? "Decoding…" : "Load & Play"}
+              {isLoading ? `Decoding… ${overallProgress}%` : "Load & Play"}
             </button>
           )}
         </div>
       </header>
 
+      {isLoading && (
+        <div className="h-1 w-full overflow-hidden rounded-full bg-stone-800">
+          <div
+            className="h-full bg-gradient-to-r from-cyan-500 to-orange-500 transition-[width]"
+            style={{ width: `${overallProgress}%` }}
+          />
+        </div>
+      )}
+
+      {isActive && (
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handlePauseToggle}
+            className="rounded-md border border-stone-700 px-3 py-1.5 text-xs text-stone-300"
+          >
+            {isPaused ? "Resume" : "Pause"}
+          </button>
+          <button
+            onClick={handleRewind}
+            className="rounded-md border border-stone-700 px-3 py-1.5 text-xs text-stone-300"
+          >
+            ⏮ Rewind
+          </button>
+        </div>
+      )}
+
       {/* Auto-behavior toggles */}
       <div className="flex flex-wrap items-center gap-2">
         <ToggleChip label="Beat sync" active={beatSync} onClick={toggleBeatSync} />
+        <ToggleChip label="Key match" active={keyMatch} onClick={toggleKeyMatch} />
         <ToggleChip label="Auto jump" active={autoJump} onClick={toggleAutoJump} />
         <ToggleChip label="Auto switch stems" active={autoStemSwitch} onClick={toggleAutoStemSwitch} />
-        {beatSync && isPlaying && (
+        {(beatSync || keyMatch) && isActive && rateB && (
           <span className="font-mono text-[10px] text-stone-500">
-            Deck B pitch {pitchShiftB >= 0 ? "+" : ""}
-            {pitchShiftB.toFixed(1)}%
+            Deck B: tempo {rateB.tempoPercent >= 0 ? "+" : ""}
+            {rateB.tempoPercent.toFixed(1)}% · pitch {rateB.pitchPercent >= 0 ? "+" : ""}
+            {rateB.pitchPercent.toFixed(1)}%
           </span>
         )}
-        {autoJump && isPlaying && (
+        {autoJump && isActive && (
           <span className="font-mono text-[10px] text-stone-500">
             branch chance {autoJumpStatus.currentProbabilityPercent.toFixed(0)}%
           </span>
@@ -272,13 +371,14 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
 
       {/* Two fully independent decks — each seekable to any beat at any
           time via its own scrubber, regardless of what the other is doing. */}
-      <div className={`space-y-3 ${isPlaying ? "" : "pointer-events-none opacity-50"}`}>
+      <div className={`space-y-3 ${isActive ? "" : "pointer-events-none opacity-50"}`}>
         <TrackScrubber
           slot="a"
           label="Deck A"
           accent="cyan"
           title={trackA.title}
           bpm={jumpMap.bpmA}
+          keyName={keyName(jumpMap.keyA)}
           beatTimes={jumpMap.beatTimesA}
           engineRef={engineRef}
           mix={mix.a}
@@ -290,6 +390,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
           accent="orange"
           title={trackB.title}
           bpm={jumpMap.bpmB}
+          keyName={keyName(jumpMap.keyB)}
           beatTimes={jumpMap.beatTimesB}
           engineRef={engineRef}
           mix={mix.b}
@@ -297,7 +398,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         />
       </div>
 
-      <div className={isPlaying ? "" : "pointer-events-none opacity-50"}>
+      <div className={isActive ? "" : "pointer-events-none opacity-50"}>
         <JumpMatrix
           heatmap={jumpMap.heatmap}
           jumpPoints={activeJumpPoints}
@@ -309,7 +410,7 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         />
       </div>
 
-      {!isPlaying && phase !== "loading" && (
+      {!isActive && !isLoading && (
         <p className="text-center text-xs text-stone-500">Hit Load & Play to wake up both decks.</p>
       )}
       {error && <p className="text-center text-sm text-red-400">{error}</p>}
@@ -319,7 +420,8 @@ export default function JukeboxPlayer({ trackA, trackB, jumpMap }) {
         onClose={() => setSettingsOpen(false)}
         settings={settings}
         onChange={(partial) => setSettings((s) => ({ ...s, ...partial }))}
-        onReset={() => setSettings(DEFAULT_SETTINGS)}
+        onReset={handleResetSettings}
+        onSaveAsDefault={handleSaveSettingsAsDefault}
         autoJumpStatus={autoJumpStatus}
         jumpPointCount={activeJumpPoints.length}
         excludedCount={excludedKeys.size}

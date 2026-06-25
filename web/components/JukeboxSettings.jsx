@@ -8,6 +8,7 @@
  * @param {{
  *   open: boolean, onClose: () => void,
  *   settings: object, onChange: (partial: object) => void, onReset: () => void,
+ *   onSaveAsDefault: () => void,
  *   autoJumpStatus: { currentProbabilityPercent: number, lastJumpScore: number|null },
  *   jumpPointCount: number, excludedCount: number, onResetExcluded: () => void,
  * }} props
@@ -18,6 +19,7 @@ export default function JukeboxSettings({
   settings,
   onChange,
   onReset,
+  onSaveAsDefault,
   autoJumpStatus,
   jumpPointCount,
   excludedCount,
@@ -61,12 +63,12 @@ export default function JukeboxSettings({
         <div className="space-y-5">
           <Slider
             label="Jump similarity threshold"
-            hint="Lower = more (but rougher) candidates. Higher = fewer, cleaner ones."
+            hint="Lower = more (but rougher) candidates. Higher = fewer, cleaner ones. Fine step on purpose — the most useful range tends to be 0.95-0.99."
             value={settings.minScore}
             min={0.8}
             max={0.99}
-            step={0.01}
-            format={(v) => v.toFixed(2)}
+            step={0.001}
+            format={(v) => v.toFixed(3)}
             onChange={(v) => set("minScore", v)}
           />
 
@@ -142,20 +144,28 @@ export default function JukeboxSettings({
           </details>
         </div>
 
-        <div className="mt-5 flex gap-2">
+        <div className="mt-5 flex flex-col gap-2">
           <button
-            onClick={onResetExcluded}
-            disabled={excludedCount === 0}
-            className="flex-1 rounded-md border border-stone-700 px-3 py-2 text-xs text-stone-300 disabled:opacity-40"
+            onClick={onSaveAsDefault}
+            className="rounded-md border border-emerald-400/40 bg-emerald-400/10 px-3 py-2 text-xs text-emerald-300"
           >
-            Restore {excludedCount} removed point{excludedCount === 1 ? "" : "s"}
+            Save as default
           </button>
-          <button
-            onClick={onReset}
-            className="flex-1 rounded-md border border-stone-700 px-3 py-2 text-xs text-stone-300"
-          >
-            Reset to defaults
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={onResetExcluded}
+              disabled={excludedCount === 0}
+              className="flex-1 rounded-md border border-stone-700 px-3 py-2 text-xs text-stone-300 disabled:opacity-40"
+            >
+              Restore {excludedCount} removed point{excludedCount === 1 ? "" : "s"}
+            </button>
+            <button
+              onClick={onReset}
+              className="flex-1 rounded-md border border-stone-700 px-3 py-2 text-xs text-stone-300"
+            >
+              Reset
+            </button>
+          </div>
         </div>
       </div>
     </div>

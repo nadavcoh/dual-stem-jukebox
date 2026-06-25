@@ -82,3 +82,32 @@ export async function getLibrary() {
     return { ok: false, error: err?.message ?? "Couldn't load the library — unknown server error." };
   }
 }
+
+/**
+ * Removes a track row — from the queue (queued/processing/failed) or the
+ * completed library, doesn't matter which.
+ *
+ * Deliberately only deletes the Supabase row, not anything in B2: this app
+ * only ever holds a *read-only* B2 key (web/lib/b2Presign.js) by design, so
+ * it has no ability to delete the uploaded stems even if it wanted to.
+ * Removing a completed track here leaves its files in the bucket — orphaned
+ * but harmless (B2 storage is cheap; a wrong delete from a write-capable
+ * frontend key is not the trade worth making for that). If that bothers
+ * you, a small cleanup pass in the worker that diffs B2 objects against
+ * existing Supabase rows is the right place for it, not this app.
+ *
+ * @param {string} trackId
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function removeFromLibrary(trackId) {
+  if (!trackId) return { ok: false, error: "Missing track id." };
+  try {
+    const supabase = supabaseAdmin();
+    const { error } = await supabase.from("tracks").delete().eq("id", trackId);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (err) {
+    console.error("[removeFromLibrary] failed:", err);
+    return { ok: false, error: err?.message ?? "Couldn't remove this track — unknown server error." };
+  }
+}

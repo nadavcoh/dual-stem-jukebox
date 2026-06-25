@@ -15,7 +15,10 @@ Polls Supabase for 'queued' tracks, claims one atomically via the
      they're different timbral content by construction (one's harmonic
      vocal formants, the other's everything-but-vocals), so a high
      cosine-similarity match between them isn't musically informative the
-     way a Track-A-vs-Track-B match is.
+     way a Track-A-vs-Track-B match is. Also detects the track's musical
+     key (Krumhansl-Schmuckler, from the instrumental's chroma) and a
+     per-stem loudness-normalization gain (RMS-based), both consumed by
+     the player for pitch-matching and volume-matching between decks.
   4. Uploads the mp3 stems + matrix.json to a private Backblaze B2 bucket
      and records their object keys (not public URLs).
   5. Marks the row 'completed' (or 'failed') in Supabase.
@@ -109,7 +112,25 @@ def download_audio(youtube_id: str, dest_dir: Path) -> tuple[Path, str]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "remote_components": "ejs:github",  # Added to fix YouTube JS challenge blocks
+        # Allows yt-dlp to fetch its External JS (EJS) challenge-solver
+        # scripts from https://github.com/yt-dlp/ejs (yt-dlp's own org) when
+        # solving YouTube's signature challenges — disabled by default for
+        # exactly the reason it sounds like: it's remote code execution,
+        # even though it's narrowly scoped to an official source and run
+        # under a JS runtime's sandbox (Deno, the default runtime, executes
+        # it with no filesystem or network access).
+        #
+        # This is a SET, not a string — yt-dlp's Python API takes
+        # remote_components as a collection (you can enable multiple, e.g.
+        # {"ejs:github", "ejs:npm"}), matching --remote-components on the
+        # CLI accepting repeated flags. A bare string here would get
+        # iterated character-by-character instead.
+        #
+        # You'll also need a supported JS runtime installed (deno
+        # recommended, enabled by default) for EJS to actually run —
+        # remote_components only governs whether the *scripts* can be
+        # fetched, not whether something can execute them.
+        "remote_components": {"ejs:github"},
     }
 
     url = f"https://www.youtube.com/watch?v={youtube_id}"
@@ -158,14 +179,75 @@ def separate_stems(input_wav: Path, dest_dir: Path) -> tuple[Path, Path]:
 
 
 # ---------------------------------------------------------------------------
+# Key detection (Krumhansl-Schmuckler) + loudness normalization
+# ---------------------------------------------------------------------------
+_PITCH_CLASS_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Krumhansl-Kessler key profiles — the classic empirically-derived relative
+# emphasis of each of the 12 pitch classes within a major/minor key, used to
+# correlate against a track's averaged chroma vector for key-finding.
+_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+# Target RMS for loudness normalization. -20 dBFS is a conservative,
+# commonly-used reference point for a normalized music stem — loud enough
+# to not need much boost on quiet vocal-only stems, quiet enough to leave
+# headroom rather than push anything toward clipping.
+_TARGET_RMS_DB = -20.0
+_GAIN_CLAMP = (0.3, 3.0)  # avoid extreme correction on near-silent stems
+
+
+def detect_key(chroma_raw: np.ndarray) -> dict:
+    """
+    chroma_raw: (12, n_frames) — raw chroma_stft output, BEFORE beat-sync
+    aggregation or any L2 normalization (those would distort the relative
+    pitch-class energies this needs). Averages across time into one
+    12-dim profile, then correlates it against all 24 rotations of the
+    major/minor Krumhansl-Kessler templates and keeps the best match.
+    """
+    profile = chroma_raw.mean(axis=1)
+    if not np.any(profile):
+        return {"pitch_class": 0, "is_major": True, "name": "C major"}
+
+    best_score = -2.0
+    best_pitch_class = 0
+    best_is_major = True
+    for pitch_class in range(12):
+        for is_major, template in ((True, _MAJOR_PROFILE), (False, _MINOR_PROFILE)):
+            rotated = np.roll(template, pitch_class)
+            score = np.corrcoef(profile, rotated)[0, 1]
+            if score > best_score:
+                best_score = score
+                best_pitch_class = pitch_class
+                best_is_major = is_major
+
+    name = f"{_PITCH_CLASS_NAMES[best_pitch_class]} {'major' if best_is_major else 'minor'}"
+    return {"pitch_class": best_pitch_class, "is_major": best_is_major, "name": name}
+
+
+def compute_normalization_gain(y: np.ndarray, target_db: float = _TARGET_RMS_DB) -> float:
+    """Linear gain multiplier to bring y's RMS loudness to target_db, clamped
+    to _GAIN_CLAMP so a near-silent stem (e.g. a sparse vocal track) doesn't
+    get boosted into amplifying noise."""
+    rms = float(np.sqrt(np.mean(np.square(y)))) if len(y) else 0.0
+    if rms <= 1e-9:
+        return 1.0
+    rms_db = 20 * np.log10(rms)
+    gain = 10 ** ((target_db - rms_db) / 20)
+    return float(np.clip(gain, *_GAIN_CLAMP))
+
+
+# ---------------------------------------------------------------------------
 # 3. Beat-synchronous Chroma + MFCC features
 # ---------------------------------------------------------------------------
-def extract_beat_features(audio_path: Path):
+def extract_beat_features(audio_path: Path) -> dict:
     """
-    Loads an audio file and returns:
+    Loads an audio file and returns a dict:
       beat_times : np.ndarray (n_beats,)   seconds
       features   : np.ndarray (n_beats, n_dims)  beat-synced chroma+mfcc, L2-normalized
       bpm        : float
+      key        : {"pitch_class": int 0-11, "is_major": bool, "name": str}
+      gain       : float — linear multiplier to normalize this stem's loudness
     """
     y, sr = librosa.load(str(audio_path), sr=SR, mono=True)
 
@@ -182,6 +264,9 @@ def extract_beat_features(audio_path: Path):
     chroma = librosa.feature.chroma_stft(y=y, sr=sr)
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
 
+    key_info = detect_key(chroma)  # from the raw chroma, before normalization
+    gain = compute_normalization_gain(y)
+
     chroma_sync = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
     mfcc_sync = librosa.util.sync(mfcc, beat_frames, aggregate=np.median)
 
@@ -192,7 +277,13 @@ def extract_beat_features(audio_path: Path):
     features = features / norms
 
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-    return beat_times, features, bpm
+    return {
+        "beat_times": beat_times,
+        "features": features,
+        "bpm": bpm,
+        "key": key_info,
+        "gain": gain,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +349,16 @@ def process_track(supabase: Client, b2, track: dict):
         vocals_mp3, instrumental_mp3 = separate_stems(source_wav, job_dir / "stems")
 
         # 3. Beat-synchronous features for each stem
-        vocal_beats, vocal_features, vocal_bpm = extract_beat_features(vocals_mp3)
-        inst_beats, inst_features, inst_bpm = extract_beat_features(instrumental_mp3)
+        vocal_data = extract_beat_features(vocals_mp3)
+        inst_data = extract_beat_features(instrumental_mp3)
+        vocal_beats, vocal_features = vocal_data["beat_times"], vocal_data["features"]
+        inst_beats, inst_features = inst_data["beat_times"], inst_data["features"]
         # The instrumental stem almost always carries the clearer rhythmic
-        # signal (drums/bass survive separation better than breath/sibilance
-        # artifacts in solo vocals), so it's the more reliable BPM estimate.
-        bpm = inst_bpm
+        # AND harmonic signal (drums/bass/chords survive separation better
+        # than breath/sibilance artifacts in solo vocals), so it's the more
+        # reliable BPM and key estimate.
+        bpm = inst_data["bpm"]
+        key_info = inst_data["key"]
 
         # 4. Beat-synchronous features for each stem — stored raw. The
         # similarity matrix that actually matters (Track A's instrumental
@@ -273,6 +368,9 @@ def process_track(supabase: Client, b2, track: dict):
         matrix_payload = {
             "youtube_id": youtube_id,
             "bpm": bpm,
+            "key": key_info,
+            "vocals_gain": vocal_data["gain"],
+            "instrumental_gain": inst_data["gain"],
             "vocal": {
                 "beat_times": vocal_beats.tolist(),
                 "features": vocal_features.tolist(),
@@ -298,6 +396,8 @@ def process_track(supabase: Client, b2, track: dict):
                 "status": "completed",
                 "title": title,
                 "bpm": bpm,
+                "key_pitch_class": key_info["pitch_class"],
+                "key_is_major": key_info["is_major"],
                 "vocals_key": vocals_key,
                 "instrumental_key": instrumental_key,
                 "matrix_json_key": matrix_json_key,

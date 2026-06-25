@@ -40,7 +40,7 @@ function nearestBeatIndex(beatTimes, timeSeconds) {
  *
  * @param {{
  *   slot: "a"|"b", label: string, accent: "cyan"|"orange",
- *   title: string, bpm: number, beatTimes: number[],
+ *   title: string, bpm: number, keyName?: string|null, beatTimes: number[],
  *   engineRef: { current: import("@/lib/audioEngine").JukeboxEngine | null },
  *   mix: { vocal: boolean, instrumental: boolean },
  *   onToggleMix: (stem: "vocal"|"instrumental") => void,
@@ -52,6 +52,7 @@ export default function TrackScrubber({
   accent,
   title,
   bpm,
+  keyName,
   beatTimes,
   engineRef,
   mix,
@@ -79,7 +80,9 @@ export default function TrackScrubber({
           </span>
           <span className="truncate text-xs text-stone-400">{title}</span>
         </div>
-        <span className="flex-shrink-0 font-mono text-[10px] text-stone-500">{Math.round(bpm)} bpm</span>
+        <span className="flex-shrink-0 font-mono text-[10px] text-stone-500">
+          {Math.round(bpm)} bpm{keyName ? ` · ${keyName}` : ""}
+        </span>
       </div>
 
       <div

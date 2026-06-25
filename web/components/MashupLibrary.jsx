@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { getLibrary } from "@/app/actions/library";
+import { getLibrary, removeFromLibrary } from "@/app/actions/library";
 
 const SLOT_STYLES = {
   a: { label: "Track A", ring: "ring-cyan-400", text: "text-cyan-300", dot: "bg-cyan-400" },
@@ -12,8 +12,12 @@ const SLOT_STYLES = {
 function SlotCard({ slot, track }) {
   const style = SLOT_STYLES[slot];
   return (
+    // min-w-0 matters here: without it, a flex child won't shrink below
+    // its content's intrinsic width, so a long title pushed the whole
+    // card (and the row) wider than the screen on mobile instead of
+    // wrapping inside it.
     <div
-      className={`flex-1 rounded-lg border border-stone-800 bg-stone-900/60 p-3 ${
+      className={`min-w-0 flex-1 rounded-lg border border-stone-800 bg-stone-900/60 p-3 ${
         track ? `ring-1 ${style.ring}` : ""
       }`}
     >
@@ -22,7 +26,7 @@ function SlotCard({ slot, track }) {
         <span className={`text-xs font-mono uppercase tracking-wide ${style.text}`}>{style.label}</span>
       </div>
       {track ? (
-        <p className="mt-1 truncate text-sm text-stone-200">{track.title ?? track.youtube_id}</p>
+        <p className="mt-1 break-words text-sm text-stone-200">{track.title ?? track.youtube_id}</p>
       ) : (
         <p className="mt-1 text-sm text-stone-500">Pick a completed track below…</p>
       )}
@@ -42,6 +46,8 @@ export default function MashupLibrary() {
   const [error, setError] = useState(null);
   const [slotA, setSlotA] = useState(null);
   const [slotB, setSlotB] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [removingId, setRemovingId] = useState(null);
   const router = useRouter();
 
   useEffect(() => {
@@ -77,7 +83,30 @@ export default function MashupLibrary() {
     router.push(`/jukebox/${slotA.youtube_id}/${slotB.youtube_id}`);
   }
 
-  const completed = tracks.filter((t) => t.status === "completed");
+  async function handleRemove(track) {
+    if (!window.confirm(`Remove "${track.title ?? track.youtube_id}"? This can't be undone.`)) return;
+    setRemovingId(track.id);
+    try {
+      const res = await removeFromLibrary(track.id);
+      if (!res.ok) {
+        setError(res.error);
+        return;
+      }
+      setTracks((prev) => prev.filter((t) => t.id !== track.id));
+      if (slotA?.id === track.id) setSlotA(null);
+      if (slotB?.id === track.id) setSlotB(null);
+    } catch (err) {
+      console.error("[MashupLibrary] remove failed:", err);
+      setError(err?.message ?? "Couldn't remove this track.");
+    } finally {
+      setRemovingId(null);
+    }
+  }
+
+  const lowerFilter = filter.trim().toLowerCase();
+  const matchesFilter = (t) => !lowerFilter || (t.title ?? t.youtube_id).toLowerCase().includes(lowerFilter);
+
+  const completed = tracks.filter((t) => t.status === "completed").filter(matchesFilter);
   const inProgress = tracks.filter((t) => t.status === "queued" || t.status === "processing");
   const failed = tracks.filter((t) => t.status === "failed");
 
@@ -96,6 +125,13 @@ export default function MashupLibrary() {
         Open Mashup
       </button>
 
+      <input
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        placeholder="Search your library…"
+        className="w-full rounded-md border border-stone-700 bg-stone-900 px-3 py-2 text-sm text-stone-100 placeholder:text-stone-500 focus:border-cyan-400 focus:outline-none"
+      />
+
       <div className="flex items-center justify-between">
         <h3 className="text-xs font-mono uppercase tracking-wide text-stone-500">
           Completed ({completed.length})
@@ -107,18 +143,20 @@ export default function MashupLibrary() {
 
       {completed.length === 0 && !loading && (
         <p className="text-sm text-stone-500">
-          Nothing finished processing yet — add songs from the Add Songs tab, then come back here.
+          {lowerFilter
+            ? "No completed tracks match that search."
+            : "Nothing finished processing yet — add songs from the Add Songs tab, then come back here."}
         </p>
       )}
 
       <ul className="max-h-80 space-y-1 overflow-y-auto rounded-lg border border-stone-800 p-1">
         {completed.map((t) => (
-          <li key={t.id} className="flex items-center gap-3 rounded-md p-2 hover:bg-white/5">
+          <li key={t.id} className="flex items-start gap-2 rounded-md p-2 hover:bg-white/5">
             <div className="min-w-0 flex-1">
-              <p className="truncate text-sm text-stone-100">{t.title ?? t.youtube_id}</p>
+              <p className="break-words text-sm text-stone-100">{t.title ?? t.youtube_id}</p>
               <p className="truncate text-xs font-mono text-stone-500">{statusNote(t)}</p>
             </div>
-            <div className="flex gap-1.5">
+            <div className="flex flex-shrink-0 gap-1.5">
               <button
                 onClick={() => pick("a", t)}
                 className="rounded border border-cyan-400/40 px-2 py-1 text-xs font-mono text-cyan-300 hover:bg-cyan-400/10"
@@ -130,6 +168,14 @@ export default function MashupLibrary() {
                 className="rounded border border-orange-400/40 px-2 py-1 text-xs font-mono text-orange-300 hover:bg-orange-400/10"
               >
                 B
+              </button>
+              <button
+                onClick={() => handleRemove(t)}
+                disabled={removingId === t.id}
+                className="rounded border border-red-400/30 px-2 py-1 text-xs font-mono text-red-300/80 hover:bg-red-400/10 disabled:opacity-40"
+                title="Remove from library"
+              >
+                ✕
               </button>
             </div>
           </li>
@@ -144,12 +190,20 @@ export default function MashupLibrary() {
           <ul className="mt-2 space-y-1">
             {[...inProgress, ...failed].map((t) => (
               <li key={t.id} className="flex items-center justify-between gap-2 px-1">
-                <span className="truncate">{t.title ?? t.youtube_id}</span>
+                <span className="min-w-0 flex-1 truncate">{t.title ?? t.youtube_id}</span>
                 <span
                   className={`shrink-0 font-mono ${t.status === "failed" ? "text-red-400" : "text-amber-300"}`}
                 >
                   {t.status}
                 </span>
+                <button
+                  onClick={() => handleRemove(t)}
+                  disabled={removingId === t.id}
+                  className="shrink-0 rounded border border-red-400/30 px-1.5 py-0.5 font-mono text-red-300/80 hover:bg-red-400/10 disabled:opacity-40"
+                  title="Remove from queue"
+                >
+                  ✕
+                </button>
               </li>
             ))}
           </ul>
